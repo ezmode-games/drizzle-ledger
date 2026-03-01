@@ -84,7 +84,7 @@ The reason is simple: the alternative is discipline. You tell your team "use `so
 
 The monkeypatch makes the wrong thing impossible. `db.delete()` does the right thing automatically. If a table has `deleted_at`, it soft-deletes. If it doesn't, it hard-deletes. You can still hard-delete explicitly via `hardDeleteTables` config. The escape hatch exists. It's just not the default.
 
-This is a pit-of-success pattern, not magic. You can read the entire implementation in ~40 lines. It intercepts one method, checks one column, and rewrites to an UPDATE. That's it.
+The right thing happens by default. You can read the entire implementation in ~40 lines. It intercepts one method, checks one column, and rewrites to an UPDATE. That's it.
 
 ### What it provides
 
