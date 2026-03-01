@@ -214,7 +214,15 @@ Beyond compliance theater:
 
 ---
 
-## GDPR Article 17: Right to Erasure
+## GDPR
+
+The audit trail and purge tooling together cover three areas of GDPR:
+
+- **Accountability (Article 5(2))** - The audit trail is your evidence that you track what happens to personal data. Who changed it, when, from where. When a regulator asks "how do you demonstrate accountability for data processing?" you point at the log.
+- **Records of processing (Article 30)** - Every audit entry is a record of a processing activity. Insert, update, delete, soft-delete, restore - each one documented with actor, timestamp, and before/after state.
+- **Breach response (Article 33)** - When a breach happens, the first question is "what was affected?" The audit trail tells you which records were accessed or modified, by whom, and when. You need that to determine scope and meet the 72-hour notification window.
+
+### Right to Erasure (Article 17)
 
 A user requests deletion of their personal data. You're legally required to comply. But you also have an audit trail full of their email, name, IP address, and user agent - data you might need for other legal obligations (fraud prevention, financial records, SOC 2).
 
@@ -255,12 +263,9 @@ const alreadyPurged = await isUserDataPurged(db, auditLog, 'user-123');
 - **Data in other tables.** This only touches the audit log. If the user's email is in a `users` table, a `newsletter_subscribers` table, and an `orders` table, you need to handle those separately.
 - **Data in other systems.** Payment processors, email providers, analytics services, CDN logs. GDPR covers all of it. This handles one table.
 - **Consent management.** No consent tracking, no preference center, no cookie banners.
-- **Data portability (Article 20).** This deletes data. It doesn't export it. If you need "give me all my data," build that separately.
-- **Automated decision making (Article 22).** Not relevant here.
-- **72-hour breach notification.** Not relevant here.
+- **Data portability (Article 20).** This anonymizes data. It doesn't export it. If you need "give me all my data," build that separately.
+- **Breach notification delivery.** The audit trail helps you determine breach scope, but it doesn't send the notification emails or file the report. That's on you.
 - **DPO tooling.** No dashboards, no request tracking, no compliance workflows.
-
-This solves one specific problem well: anonymize PII in audit logs without destroying the audit trail. Everything else in GDPR is your responsibility.
 
 ---
 
