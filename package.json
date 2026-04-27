@@ -120,7 +120,7 @@
     "format": "oxfmt --write src/ test/",
     "format:check": "oxfmt --check src/ test/",
     "preflight": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm test",
-    "postinstall": "lefthook install",
+    "prepare": "lefthook install",
     "prepublishOnly": "pnpm build",
     "changeset": "changeset",
     "release": "pnpm build && changeset publish"
