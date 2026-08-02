@@ -24,7 +24,15 @@ export interface PurgeResult {
   tablesProcessed: string[];
 }
 
-/** Default PII fields to remove from JSON data */
+/**
+ * Default PII fields to remove from JSON data.
+ *
+ * Deliberately excludes message-shaped fields: `to`, `from`, `subject`,
+ * and `body` are NOT in this list. A mail-flavored consumer whose audit
+ * payloads carry email content must pass those (and any other structural
+ * variants like `recipients`) explicitly via `piiFields`, or the purge
+ * will leave full message content behind.
+ */
 export const DEFAULT_PII_FIELDS = [
   "email",
   "name",
