@@ -40,6 +40,7 @@
 import type { BetterAuthPlugin, User } from "better-auth";
 import { softDeleteValues } from "./core/soft-delete.js";
 import { SoftDeletePerformedError, isSoftDeletePerformed } from "./core/errors.js";
+import { redactSensitiveFields } from "./core/redact.js";
 
 /**
  * Audit entry passed to the writeAuditEntry callback.
@@ -76,16 +77,45 @@ export interface LedgerPluginConfig {
    */
   writeAuditEntry?: (entry: LedgerAuditEntry) => Promise<void>;
   /**
-   * Tables to audit. Defaults to ['user', 'account'].
+   * Tables to audit. Defaults to ['user'].
+   *
+   * WARNING: 'account' rows carry OAuth accessToken/refreshToken/idToken
+   * and credential password hashes. Redaction strips those fields before
+   * any audit write, but auditing 'account' remains opt-in -- enable it
+   * only with an actual compliance need.
    * Session and verification are excluded by default due to high volume.
    */
   auditTables?: ("user" | "account" | "session" | "verification")[];
+  /**
+   * Additional key patterns to redact beyond DEFAULT_SECRET_PATTERNS
+   * (token/secret/password/apikey/api_key, case-insensitive substring
+   * match). Redaction itself cannot be disabled: if redaction fails,
+   * the audit entry is NOT written.
+   */
+  redactPatterns?: readonly string[];
 }
 
 // Helper to safely log errors without blocking auth operations
 function safeLog(message: string, error?: unknown): void {
   // eslint-disable-next-line no-console
   console.error(`[ledger] ${message}`, error ?? "");
+}
+
+/**
+ * Redact secret material from an audit entry's payloads.
+ * Applied on EVERY plugin audit path before the sink sees the entry --
+ * better-auth rows (account especially) carry OAuth tokens and password
+ * hashes, and an audit trail must never become a secrets store.
+ */
+function redactAuditEntry(
+  entry: LedgerAuditEntry,
+  extraPatterns?: readonly string[],
+): LedgerAuditEntry {
+  return {
+    ...entry,
+    oldData: redactSensitiveFields(entry.oldData, extraPatterns),
+    newData: redactSensitiveFields(entry.newData, extraPatterns),
+  };
 }
 
 // Type for better-auth user with id
@@ -125,15 +155,24 @@ type UserWithId = { id: string } & Record<string, unknown>;
  * ```
  */
 export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
-  const auditTables = config?.auditTables ?? ["user", "account"];
+  const auditTables = config?.auditTables ?? ["user"];
   const softDeleteTables = config?.softDeleteTables ?? [];
   const writeAuditEntry = config?.writeAuditEntry;
+  const redactPatterns = config?.redactPatterns;
 
-  // Helper to safely write audit entry
+  // Helper to safely write audit entry. Redaction is fail-closed: an
+  // entry that cannot be redacted is never written.
   async function audit(entry: LedgerAuditEntry): Promise<void> {
     if (!writeAuditEntry) return;
+    let redacted: LedgerAuditEntry;
     try {
-      await writeAuditEntry(entry);
+      redacted = redactAuditEntry(entry, redactPatterns);
+    } catch (error) {
+      safeLog("Redaction failed; audit entry NOT written", error);
+      return;
+    }
+    try {
+      await writeAuditEntry(redacted);
     } catch (error) {
       safeLog("Failed to write audit entry", error);
     }
@@ -239,6 +278,11 @@ export interface SoftDeleteCallbackOptions {
    * Callback to write audit entry (optional).
    */
   writeAuditEntry?: (entry: LedgerAuditEntry) => Promise<void>;
+  /**
+   * Additional key patterns to redact beyond DEFAULT_SECRET_PATTERNS.
+   * Redaction itself cannot be disabled.
+   */
+  redactPatterns?: readonly string[];
 }
 
 /**
@@ -294,17 +338,22 @@ export function createSoftDeleteCallback(
       })
       .where(whereUserId(user.id));
 
-    // Log to audit
+    // Log to audit (redacted, fail-closed on redaction failure)
     if (writeAuditEntry) {
       try {
-        await writeAuditEntry({
-          tableName: "user",
-          recordId: user.id,
-          action: "SOFT_DELETE",
-          oldData: user as unknown as Record<string, unknown>,
-          newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
-          userId: user.id,
-        });
+        await writeAuditEntry(
+          redactAuditEntry(
+            {
+              tableName: "user",
+              recordId: user.id,
+              action: "SOFT_DELETE",
+              oldData: user as unknown as Record<string, unknown>,
+              newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
+              userId: user.id,
+            },
+            options.redactPatterns,
+          ),
+        );
       } catch (error) {
         safeLog("Failed to write audit entry for soft-delete", error);
       }
@@ -344,17 +393,23 @@ export function createSoftDeleteCallback(
  */
 export function createDeleteAuditCallback(
   writeAuditEntry: (entry: LedgerAuditEntry) => Promise<void>,
+  redactPatterns?: readonly string[],
 ): (user: User, request?: Request) => Promise<void> {
   return async (user: User, _request?: Request): Promise<void> => {
     try {
-      await writeAuditEntry({
-        tableName: "user",
-        recordId: user.id,
-        action: "DELETE", // Hard delete action (user was permanently deleted)
-        oldData: user as unknown as Record<string, unknown>,
-        newData: null,
-        userId: user.id,
-      });
+      await writeAuditEntry(
+        redactAuditEntry(
+          {
+            tableName: "user",
+            recordId: user.id,
+            action: "DELETE", // Hard delete action (user was permanently deleted)
+            oldData: user as unknown as Record<string, unknown>,
+            newData: null,
+            userId: user.id,
+          },
+          redactPatterns,
+        ),
+      );
     } catch (error) {
       safeLog("Failed to write audit entry for delete", error);
     }
