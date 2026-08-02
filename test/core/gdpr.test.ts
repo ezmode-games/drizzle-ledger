@@ -81,6 +81,59 @@ describe("anonymizeJsonData", () => {
     });
   });
 
+  test("matches keys case-insensitively", () => {
+    const data = { Email: "a@test.com", EMAIL: "b@test.com", eMaIl: "c@test.com", role: "admin" };
+    const result = anonymizeJsonData(data, ["email"]);
+
+    expect(result).toEqual({ role: "admin" });
+  });
+
+  test("does not match structural variants of a field name", () => {
+    const data = { user_email: "a@test.com", emails: ["b@test.com"] };
+    const result = anonymizeJsonData(data, ["email"]);
+
+    expect(result).toEqual({ user_email: "a@test.com", emails: ["b@test.com"] });
+  });
+
+  test("preserves top-level arrays as arrays", () => {
+    const data = [{ email: "a@test.com", id: "1" }, { id: "2" }];
+    const result = anonymizeJsonData(data, ["email"]);
+
+    expect(Array.isArray(result)).toBe(true);
+    expect(result).toEqual([{ id: "1" }, { id: "2" }]);
+  });
+
+  test("preserves nested arrays at depth", () => {
+    const data = { batches: [[{ email: "a@test.com", id: "1" }], [{ id: "2" }]] };
+    const result = anonymizeJsonData(data, ["email"]);
+
+    expect(result).toEqual({ batches: [[{ id: "1" }], [{ id: "2" }]] });
+  });
+
+  test("passes primitives through unchanged", () => {
+    expect(anonymizeJsonData("a string", ["email"])).toBe("a string");
+    expect(anonymizeJsonData(42, ["email"])).toBe(42);
+    expect(anonymizeJsonData(true, ["email"])).toBe(true);
+  });
+
+  test("never throws on any JSON-representable shape", () => {
+    const shapes: unknown[] = [
+      null,
+      0,
+      -1.5,
+      "",
+      false,
+      [],
+      {},
+      [[[]]],
+      { a: { b: { c: [null, { email: "x" }] } } },
+      [null, undefined, { email: null }],
+    ];
+    for (const shape of shapes) {
+      expect(() => anonymizeJsonData(shape, ["email"])).not.toThrow();
+    }
+  });
+
   test("handles mixed nested and top-level PII", () => {
     const data = {
       email: "top@test.com",

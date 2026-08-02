@@ -38,16 +38,24 @@ export const DEFAULT_PII_FIELDS = [
 ];
 
 /**
- * Remove PII fields from a JSON object.
- * Recursively processes nested objects.
+ * Remove PII fields from a JSON value.
+ * Recursively processes nested objects and arrays; arrays stay arrays
+ * at every depth. Field matching is case-insensitive on the exact key
+ * name ('email' removes 'Email' and 'EMAIL', but not 'user_email' or
+ * 'emails' -- list structural variants explicitly).
  *
- * @param data - The data to anonymize (can be null)
- * @param piiFields - Fields to remove
- * @returns Anonymized data with PII fields removed
+ * Limitation: this removes matching keys only. PII embedded inside the
+ * VALUE of a non-matching key (an address in a free-text 'notes' field,
+ * an email inside a message body) is out of reach -- payloads with prose
+ * need field-level purging by the caller.
+ *
+ * @param data - The JSON value to anonymize
+ * @param piiFields - Field names to remove (case-insensitive)
+ * @returns Anonymized value with PII fields removed
  *
  * @example
  * ```typescript
- * const data = { id: '123', email: 'test@test.com', name: 'John', role: 'admin' };
+ * const data = { id: '123', Email: 'test@test.com', name: 'John', role: 'admin' };
  * const result = anonymizeJsonData(data, ['email', 'name']);
  * // { id: '123', role: 'admin' }
  * ```
@@ -55,35 +63,28 @@ export const DEFAULT_PII_FIELDS = [
 export function anonymizeJsonData(
   data: Record<string, unknown> | null,
   piiFields: string[],
-): Record<string, unknown> | null {
-  if (data === null) {
-    return null;
+): Record<string, unknown> | null;
+export function anonymizeJsonData(data: unknown, piiFields: string[]): unknown;
+export function anonymizeJsonData(data: unknown, piiFields: string[]): unknown {
+  const loweredFields = new Set(piiFields.map((field) => field.toLowerCase()));
+  return anonymizeValue(data, loweredFields);
+}
+
+function anonymizeValue(value: unknown, loweredFields: Set<string>): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => anonymizeValue(item, loweredFields));
   }
 
-  const result: Record<string, unknown> = {};
-  const piiFieldsSet = new Set(piiFields);
-
-  for (const [key, value] of Object.entries(data)) {
-    // Skip PII fields
-    if (piiFieldsSet.has(key)) {
-      continue;
+  if (value !== null && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (loweredFields.has(key.toLowerCase())) {
+        continue;
+      }
+      result[key] = anonymizeValue(entry, loweredFields);
     }
-
-    // Recursively process nested objects
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-      result[key] = anonymizeJsonData(value as Record<string, unknown>, piiFields);
-    } else if (Array.isArray(value)) {
-      // Process arrays - anonymize objects within arrays
-      result[key] = value.map((item) => {
-        if (item !== null && typeof item === "object") {
-          return anonymizeJsonData(item as Record<string, unknown>, piiFields);
-        }
-        return item;
-      });
-    } else {
-      result[key] = value;
-    }
+    return result;
   }
 
-  return result;
+  return value;
 }
