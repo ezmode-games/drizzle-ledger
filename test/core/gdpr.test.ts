@@ -134,6 +134,29 @@ describe("anonymizeJsonData", () => {
     }
   });
 
+  test("a literal __proto__ key round-trips as an own property, not a prototype swap", () => {
+    const parsed = JSON.parse('{"__proto__":{"isAdmin":true},"id":"1"}') as Record<string, unknown>;
+    const result = anonymizeJsonData(parsed, ["email"]) as Record<string, unknown>;
+
+    // The key survives as data, visible to JSON.stringify
+    expect(JSON.stringify(result)).toBe('{"__proto__":{"isAdmin":true},"id":"1"}');
+    // The prototype was NOT swapped: no inherited isAdmin
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    expect((result as { isAdmin?: unknown }).isAdmin).toBeUndefined();
+  });
+
+  test("a nested __proto__ key round-trips too", () => {
+    const parsed = JSON.parse('{"outer":{"__proto__":{"x":1},"keep":2}}') as Record<
+      string,
+      unknown
+    >;
+    const result = anonymizeJsonData(parsed, ["email"]) as Record<string, unknown>;
+
+    expect(JSON.stringify(result)).toBe('{"outer":{"__proto__":{"x":1},"keep":2}}');
+    const outer = result.outer as Record<string, unknown>;
+    expect(Object.getPrototypeOf(outer)).toBe(Object.prototype);
+  });
+
   test("handles mixed nested and top-level PII", () => {
     const data = {
       email: "top@test.com",
