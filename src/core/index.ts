@@ -49,4 +49,8 @@ export {
 } from "./gdpr.js";
 
 // Errors
-export { isSoftDeletePerformed, SoftDeletePerformedError } from "./errors.js";
+export {
+  isSoftDeletePerformed,
+  MissingSoftDeleteColumnError,
+  SoftDeletePerformedError,
+} from "./errors.js";

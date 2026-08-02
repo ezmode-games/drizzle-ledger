@@ -51,3 +51,21 @@ export function isSoftDeletePerformed(error: unknown): error is SoftDeletePerfor
   }
   return false;
 }
+
+/**
+ * Error thrown by createAuditedDb in allowlist mode when a table listed
+ * in softDeleteTables is deleted from but has no deletedAt property.
+ * Loud failure instead of a silent fallback to hard delete.
+ */
+export class MissingSoftDeleteColumnError extends Error {
+  readonly code = "MISSING_SOFT_DELETE_COLUMN" as const;
+  readonly tableName: string;
+
+  constructor(tableName: string) {
+    super(
+      `Table '${tableName}' is listed in softDeleteTables but has no deletedAt column property`,
+    );
+    this.name = "MissingSoftDeleteColumnError";
+    this.tableName = tableName;
+  }
+}

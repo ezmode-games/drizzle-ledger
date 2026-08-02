@@ -2,6 +2,8 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { describe, expect, test, vi } from "vitest";
 import { createAuditedDb, getTableName, hasColumn } from "../../src/drizzle/db.js";
 import { createLedgerContext, runWithLedgerContext } from "../../src/core/context.js";
+import { MissingSoftDeleteColumnError } from "../../src/core/errors.js";
+import type { AuditLogEntry } from "../../src/core/types.js";
 
 // Test tables
 const usersWithSoftDelete = sqliteTable("users", {
@@ -200,5 +202,144 @@ describe("createAuditedDb", () => {
     await auditedDb.delete(usersWithSoftDelete).where({ id: "user-123" }).execute();
 
     expect(mockUpdateResult.execute).toHaveBeenCalled();
+  });
+
+  test("does not mutate the original db instance", () => {
+    const { db, deleteSpy, updateSpy } = createMockDb();
+
+    createAuditedDb(db);
+
+    // The original reference keeps original hard-delete behavior.
+    db.delete(usersWithSoftDelete);
+    expect(deleteSpy).toHaveBeenCalledWith(usersWithSoftDelete);
+    expect(updateSpy).not.toHaveBeenCalled();
+  });
+
+  test("directly awaiting an unfiltered delete executes soft-delete-all, no silent no-op", async () => {
+    // Thenable set-chain, like Drizzle's real QueryPromise builders.
+    const executions: string[] = [];
+    const chain = {
+      where: vi.fn(() => chain),
+      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      then: (onFulfilled?: (v: unknown) => unknown) =>
+        Promise.resolve("executed").then((v) => {
+          executions.push("run");
+          return onFulfilled ? onFulfilled(v) : v;
+        }),
+    };
+    const set = vi.fn(() => chain);
+    const db = {
+      delete: vi.fn(),
+      update: vi.fn(() => ({ set })),
+    };
+
+    const auditedDb = createAuditedDb(db);
+
+    const result = await auditedDb.delete(usersWithSoftDelete);
+
+    // The statement executed (Drizzle delete-all semantics preserved as
+    // soft-delete-all); previously this resolved to a dead {where} object.
+    expect(executions).toEqual(["run"]);
+    expect(result).toBe("executed");
+    expect(set).toHaveBeenCalled();
+    expect(db.delete).not.toHaveBeenCalled();
+  });
+
+  test("deletes inside transactions are converted", async () => {
+    const { db, updateSpy, mockUpdateWithSet } = createMockDb();
+    const txDb = {
+      ...db,
+      transaction: vi.fn(async (cb: (tx: unknown) => unknown) => cb(db)),
+    };
+
+    const auditedDb = createAuditedDb(txDb);
+
+    await auditedDb.transaction(async (tx) => {
+      (tx as typeof auditedDb).delete(usersWithSoftDelete).where({ id: "user-123" });
+    });
+
+    expect(updateSpy).toHaveBeenCalledWith(usersWithSoftDelete);
+    expect(mockUpdateWithSet.set).toHaveBeenCalled();
+  });
+
+  test("allowlist mode: listed table converts, unlisted hard-deletes", () => {
+    const { db, deleteSpy, updateSpy } = createMockDb();
+
+    const auditedDb = createAuditedDb(db, { softDeleteTables: ["users"] });
+
+    auditedDb.delete(usersWithSoftDelete).where({ id: "u1" });
+    expect(updateSpy).toHaveBeenCalledWith(usersWithSoftDelete);
+
+    // logs has no deletedAt AND is unlisted: hard delete, no throw
+    auditedDb.delete(logsWithoutSoftDelete).where({ id: "l1" });
+    expect(deleteSpy).toHaveBeenCalledWith(logsWithoutSoftDelete);
+  });
+
+  test("allowlist mode: listed table without deletedAt throws instead of hard-deleting", () => {
+    const { db, deleteSpy } = createMockDb();
+
+    const auditedDb = createAuditedDb(db, { softDeleteTables: ["logs"] });
+
+    expect(() => auditedDb.delete(logsWithoutSoftDelete)).toThrow(MissingSoftDeleteColumnError);
+    expect(deleteSpy).not.toHaveBeenCalled();
+  });
+
+  test("writes a SOFT_DELETE audit entry once per executed statement", async () => {
+    const entries: AuditLogEntry[] = [];
+    const chain = {
+      where: vi.fn(() => chain),
+      returning: vi.fn(() => chain),
+      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      then: (onFulfilled?: (v: unknown) => unknown) =>
+        Promise.resolve([{ id: "u1" }]).then((v) => (onFulfilled ? onFulfilled(v) : v)),
+    };
+    const db = {
+      delete: vi.fn(),
+      update: vi.fn(() => ({ set: vi.fn(() => chain) })),
+    };
+
+    const auditedDb = createAuditedDb(db, {
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    await auditedDb.delete(usersWithSoftDelete).where({ id: "u1" }).returning();
+    // Allow the fire-and-forget audit write to settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].action).toBe("SOFT_DELETE");
+    expect(entries[0].tableName).toBe("users");
+    expect(entries[0].recordId).toBe("unknown");
+    expect(entries[0].newData?.deletedAt).toBeInstanceOf(Date);
+  });
+
+  test("no audit entry for a statement that is never executed", async () => {
+    const entries: AuditLogEntry[] = [];
+    const chain = {
+      where: vi.fn(() => chain),
+      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      then: (onFulfilled?: (v: unknown) => unknown) =>
+        Promise.resolve(undefined).then((v) => (onFulfilled ? onFulfilled(v) : v)),
+    };
+    const db = {
+      delete: vi.fn(),
+      update: vi.fn(() => ({ set: vi.fn(() => chain) })),
+    };
+
+    const auditedDb = createAuditedDb(db, {
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    // Built but never awaited/executed
+    auditedDb.delete(usersWithSoftDelete).where({ id: "u1" });
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(entries).toHaveLength(0);
   });
 });
