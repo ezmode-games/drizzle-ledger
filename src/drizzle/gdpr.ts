@@ -21,18 +21,32 @@ export {
 const DEFAULT_ANONYMIZED_USER_ID = "PURGED_USER";
 
 /**
- * Safely parse JSON string, returning null on error.
+ * Parse a stored JSON column, distinguishing "column is NULL" and
+ * "parsed successfully" from "stored text is not valid JSON".
+ * Malformed JSON must be left byte-for-byte untouched by the purge,
+ * never overwritten -- so the caller needs to know parsing failed.
  */
-function safeJsonParse(json: string | null): Record<string, unknown> | null {
+function parseStoredJson(json: string | null): { ok: true; value: unknown } | { ok: false } {
   if (json === null) {
-    return null;
+    return { ok: true, value: null };
   }
   try {
-    return JSON.parse(json) as Record<string, unknown>;
+    return { ok: true, value: JSON.parse(json) };
   } catch {
-    // Return null for malformed JSON
+    return { ok: false };
+  }
+}
+
+/**
+ * Serialize an anonymized value back to the stored column shape.
+ * A NULL column round-trips as NULL; everything else (objects, arrays,
+ * primitives) round-trips as its JSON text.
+ */
+function serializeAnonymized(value: unknown): string | null {
+  if (value === null) {
     return null;
   }
+  return JSON.stringify(value);
 }
 
 // Type for Drizzle database with update capability
@@ -99,12 +113,17 @@ export async function purgeUserData(
   for (const entry of entries) {
     tablesProcessed.add(entry.tableName);
 
-    // Parse and anonymize JSON data
-    const oldData = safeJsonParse(entry.oldData);
-    const newData = safeJsonParse(entry.newData);
+    // Parse and anonymize JSON data. Stored text that fails to parse is
+    // left untouched -- the purge must never destroy entries it cannot read.
+    const oldParsed = parseStoredJson(entry.oldData);
+    const newParsed = parseStoredJson(entry.newData);
 
-    const anonymizedOldData = anonymizeJsonData(oldData, piiFields);
-    const anonymizedNewData = anonymizeJsonData(newData, piiFields);
+    const anonymizedOldData = oldParsed.ok
+      ? serializeAnonymized(anonymizeJsonData(oldParsed.value, piiFields))
+      : entry.oldData;
+    const anonymizedNewData = newParsed.ok
+      ? serializeAnonymized(anonymizeJsonData(newParsed.value, piiFields))
+      : entry.newData;
 
     // Update the entry
     // Only anonymize userId/ip/userAgent when entry.userId matches the purged user
@@ -115,8 +134,8 @@ export async function purgeUserData(
         userId: entry.userId === userId ? anonymizedUserId : entry.userId,
         ip: entry.userId === userId ? null : entry.ip,
         userAgent: entry.userId === userId ? null : entry.userAgent,
-        oldData: anonymizedOldData ? JSON.stringify(anonymizedOldData) : null,
-        newData: anonymizedNewData ? JSON.stringify(anonymizedNewData) : null,
+        oldData: anonymizedOldData,
+        newData: anonymizedNewData,
       })
       .where(eq(auditTable.id, entry.id));
 

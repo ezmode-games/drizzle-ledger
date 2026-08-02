@@ -307,10 +307,61 @@ describe("purgeUserData", () => {
     );
 
     expect(result.entriesAnonymized).toBe(1);
-    // Malformed JSON results in null
-    expect(updatedValues[0].oldData).toBeNull();
+    // Malformed JSON is left byte-for-byte untouched, never destroyed
+    expect(updatedValues[0].oldData).toBe("not valid json");
     // Valid JSON is anonymized
     expect(updatedValues[0].newData).toBe('{"valid":"json"}');
+  });
+
+  test("preserves array-shaped JSON payloads as arrays", async () => {
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "messages",
+        recordId: "user-123",
+        action: "UPDATE",
+        oldData: JSON.stringify([{ email: "a@test.com", id: "1" }, "keep-me", 42]),
+        newData: JSON.stringify({ recipients: [{ email: "b@test.com", id: "2" }] }),
+        userId: "user-123",
+        ip: "1.2.3.4",
+        userAgent: "UA",
+        createdAt: new Date(),
+      },
+    ];
+
+    const updatedValues: Record<string, unknown>[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          updatedValues.push(values);
+          return {
+            where: vi.fn().mockResolvedValue(undefined),
+          };
+        }),
+      }),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    // Top-level array survives as an array, not {"0": ..., "1": ...}
+    expect(JSON.parse(updatedValues[0].oldData as string)).toEqual([{ id: "1" }, "keep-me", 42]);
+    // Nested arrays survive too
+    expect(JSON.parse(updatedValues[0].newData as string)).toEqual({ recipients: [{ id: "2" }] });
   });
 
   test("preserves userId for entries by other users about this user", async () => {
