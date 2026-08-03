@@ -57,3 +57,15 @@ export const AUDIT_LOG_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
   "CREATE INDEX IF NOT EXISTS idx_audit_log_request ON audit_log(request_id)",
 ] as const;
+
+/**
+ * Optional append-only protection: rules that reject UPDATE and DELETE
+ * on the audit table at the engine. Apply in a migration.
+ * NOTE: purgeUserData legitimately UPDATEs audit rows -- if you use the
+ * GDPR purge, apply only the delete-blocking rule, or drop and
+ * re-create the update rule around purge runs.
+ */
+export const AUDIT_LOG_PROTECT_SQL = [
+  "CREATE OR REPLACE RULE audit_log_no_update AS ON UPDATE TO audit_log DO INSTEAD NOTHING",
+  "CREATE OR REPLACE RULE audit_log_no_delete AS ON DELETE TO audit_log DO INSTEAD NOTHING",
+] as const;

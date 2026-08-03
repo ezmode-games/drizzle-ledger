@@ -3,6 +3,7 @@ import { describe, expect, test, vi } from "vitest";
 import { createAuditedDb, getTableName, hasColumn } from "../../src/drizzle/db.js";
 import { createLedgerContext, runWithLedgerContext } from "../../src/core/context.js";
 import {
+  AuditTableDeleteError,
   MissingSoftDeleteColumnError,
   UnresolvedSoftDeleteTableError,
 } from "../../src/core/errors.js";
@@ -205,6 +206,31 @@ describe("createAuditedDb", () => {
     await auditedDb.delete(usersWithSoftDelete).where({ id: "user-123" }).execute();
 
     expect(mockUpdateResult.execute).toHaveBeenCalled();
+  });
+
+  test("deletes on the audit table throw through the wrapper", () => {
+    const { db, deleteSpy, updateSpy } = createMockDb();
+    const auditTable = sqliteTable("audit_log", {
+      id: text("id").primaryKey(),
+    });
+
+    const auditedDb = createAuditedDb(db);
+
+    expect(() => auditedDb.delete(auditTable)).toThrow(AuditTableDeleteError);
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(updateSpy).not.toHaveBeenCalled();
+  });
+
+  test("custom auditTableName is honored by the delete guard", () => {
+    const { db, deleteSpy } = createMockDb();
+    const customAudit = sqliteTable("my_audit", {
+      id: text("id").primaryKey(),
+    });
+
+    const auditedDb = createAuditedDb(db, { auditTableName: "my_audit" });
+
+    expect(() => auditedDb.delete(customAudit)).toThrow(AuditTableDeleteError);
+    expect(deleteSpy).not.toHaveBeenCalled();
   });
 
   test("does not mutate the original db instance", () => {

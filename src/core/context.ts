@@ -23,6 +23,7 @@
  * ```
  */
 
+import { LedgerContextUnavailableError } from "./errors.js";
 import type { LedgerContext } from "./types.js";
 
 // Use global AsyncLocalStorage (Cloudflare Workers compatible)
@@ -36,6 +37,7 @@ import type { LedgerContext } from "./types.js";
  */
 let ledgerStorage: AsyncLocalStorage<LedgerContext> | null = null;
 let storageInitialized = false;
+let degradationWarned = false;
 
 function getStorage(): AsyncLocalStorage<LedgerContext> | null {
   if (!storageInitialized) {
@@ -45,7 +47,36 @@ function getStorage(): AsyncLocalStorage<LedgerContext> | null {
       ledgerStorage = new AsyncLocalStorage<LedgerContext>();
     }
   }
+  if (ledgerStorage === null && !degradationWarned) {
+    degradationWarned = true;
+    // Silent degradation of a security feature is worse than noise:
+    // without AsyncLocalStorage every audit entry gets userId null and
+    // every soft-delete gets deletedBy null, with nothing to say why.
+    console.error(
+      "[ledger] AsyncLocalStorage is not available in this runtime; ledger context is disabled -- audit entries will be unattributed (userId null). Call assertLedgerContextAvailable() at boot to fail fast instead.",
+    );
+  }
   return ledgerStorage;
+}
+
+/**
+ * Throw at boot if AsyncLocalStorage is unavailable, instead of
+ * shipping an unattributed audit trail. Without this check the context
+ * degrades with a single console warning: every entry's userId is null
+ * and every soft-delete's deletedBy is null.
+ *
+ * @throws LedgerContextUnavailableError when AsyncLocalStorage is missing
+ *
+ * @example
+ * ```typescript
+ * // Worker boot / app entry
+ * assertLedgerContextAvailable();
+ * ```
+ */
+export function assertLedgerContextAvailable(): void {
+  if (getStorage() === null) {
+    throw new LedgerContextUnavailableError();
+  }
 }
 
 /**

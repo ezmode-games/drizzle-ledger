@@ -23,6 +23,13 @@ export class SoftDeletePerformedError extends Error {
 /**
  * Check if an error is a soft-delete success error.
  *
+ * TRUST BOUNDARY: this duck-types on `code` and `softDeleted` so the
+ * check survives cross-realm and multi-copy module setups where
+ * instanceof fails. That makes it spoofable BY DESIGN -- but only by
+ * code already running inside your process. Never apply it to errors
+ * that originate from client-supplied data; treating an
+ * attacker-shaped object as "delete succeeded" is on the caller.
+ *
  * @param error - The error to check
  * @returns true if this is a soft-delete success
  *
@@ -83,5 +90,37 @@ export class UnresolvedSoftDeleteTableError extends Error {
       "Cannot resolve the table name for a delete in softDeleteTables allowlist mode; refusing to guess between soft and hard delete",
     );
     this.name = "UnresolvedSoftDeleteTableError";
+  }
+}
+
+/**
+ * Error thrown by assertLedgerContextAvailable when AsyncLocalStorage
+ * is missing from the runtime: ledger context (and with it audit
+ * attribution and deletedBy stamping) cannot function.
+ */
+export class LedgerContextUnavailableError extends Error {
+  readonly code = "LEDGER_CONTEXT_UNAVAILABLE" as const;
+
+  constructor() {
+    super(
+      "AsyncLocalStorage is not available in this runtime; ledger context cannot function and audit entries would be unattributed",
+    );
+    this.name = "LedgerContextUnavailableError";
+  }
+}
+
+/**
+ * Error thrown by createAuditedDb when a delete targets the audit log
+ * table: the trail must not be wipeable through ledger's own APIs.
+ * Pair with AUDIT_LOG_PROTECT_SQL for engine-level enforcement.
+ */
+export class AuditTableDeleteError extends Error {
+  readonly code = "AUDIT_TABLE_DELETE" as const;
+  readonly tableName: string;
+
+  constructor(tableName: string) {
+    super(`Refusing to delete from audit table '${tableName}' through the audited db wrapper`);
+    this.name = "AuditTableDeleteError";
+    this.tableName = tableName;
   }
 }

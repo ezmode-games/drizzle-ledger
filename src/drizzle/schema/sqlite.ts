@@ -67,3 +67,16 @@ export const AUDIT_LOG_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
   "CREATE INDEX IF NOT EXISTS idx_audit_log_request ON audit_log(request_id)",
 ] as const;
+
+/**
+ * Optional append-only protection: database-level triggers that reject
+ * UPDATE and DELETE on the audit table, making tampering fail at the
+ * engine no matter which code path attempts it. Apply in a migration.
+ * NOTE: purgeUserData legitimately UPDATEs audit rows -- if you use the
+ * GDPR purge, apply only the delete-blocking trigger, or drop and
+ * re-create the update trigger around purge runs.
+ */
+export const AUDIT_LOG_PROTECT_SQL = [
+  "CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END",
+  "CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END",
+] as const;

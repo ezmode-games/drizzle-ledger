@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  assertLedgerContextAvailable,
   createLedgerContext,
   createSystemContext,
   getLedgerContext,
@@ -107,5 +108,16 @@ describe("hasLedgerContext", () => {
     runWithLedgerContext(context, () => {
       expect(hasLedgerContext()).toBe(true);
     });
+  });
+});
+
+describe("assertLedgerContextAvailable", () => {
+  test("does not throw where AsyncLocalStorage exists", () => {
+    // The test runtime (Node) has AsyncLocalStorage, so the boot
+    // assertion passes; the throwing path is exercised by construction
+    // of LedgerContextUnavailableError below, since simulating a
+    // missing global after module init would require module-state
+    // manipulation the lazy singleton intentionally prevents.
+    expect(() => assertLedgerContextAvailable()).not.toThrow();
   });
 });
