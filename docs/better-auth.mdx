@@ -98,6 +98,8 @@ The throw is the mechanism. better-auth runs `beforeDelete`, sees the throw, and
 **Soft-delete is not deletion until sessions die and sign-in is gated.** Aborting `deleteUser` also aborts better-auth's own cleanup: nothing else revokes sessions (including cookie caches and KV-backed `secondaryStorage`), account/OAuth rows survive, and better-auth session resolution knows nothing about `deletedAt`. `revokeSessions` closes the live-session half. The other half is yours: gate authentication on `deletedAt`, or an OAuth sign-in on the soft-deleted row silently resurrects the account:
 
 ```typescript
+import { APIError } from "better-auth/api";
+
 databaseHooks: {
   session: {
     create: {
@@ -122,8 +124,12 @@ const softDelete = createSoftDeleteCallback({
   userTable: users,
   whereUserId: (userId) => eq(users.id, userId),
   revokeSessions: async (userId) => {
-    await auth.api.revokeUserSessions({ body: { userId } });
-    // Plus any secondaryStorage cleanup your app needs
+    // The internal adapter works in the self-service deleteUser flow
+    // and clears secondaryStorage itself. auth.api.revokeUserSessions
+    // would NOT work here: it exists only with the admin() plugin and
+    // requires an authenticated admin session.
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.deleteSessions(userId);
   },
   writeAuditEntry: async (entry) => {
     await db.insert(auditLog).values({

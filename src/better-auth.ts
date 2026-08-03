@@ -23,7 +23,8 @@
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
- *           await auth.api.revokeUserSessions({ body: { userId } });
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
  *         },
  *       }),
  *     },
@@ -284,10 +285,14 @@ export interface SoftDeleteCallbackOptions {
    * cleanup, so nothing else revokes sessions: without this, a
    * "deleted" user keeps every live session (cookie cache, KV-backed
    * secondaryStorage, session rows) until natural expiry. Wire it to
-   * better-auth's session revocation (e.g.
-   * auth.api.revokeUserSessions / the internal adapter) AND any
-   * secondaryStorage the app uses. Making deletion incomplete should
-   * require deliberately writing a no-op, not forgetting a field.
+   * better-auth's INTERNAL adapter --
+   * (await auth.$context).internalAdapter.deleteSessions(userId) --
+   * which also clears secondaryStorage. Do not use
+   * auth.api.revokeUserSessions: it exists only with the admin()
+   * plugin and is gated on an authenticated admin session, which the
+   * self-service deleteUser flow does not have. Making deletion
+   * incomplete should require deliberately writing a no-op, not
+   * forgetting a field.
    */
   revokeSessions: (userId: string) => Promise<void>;
   /**
@@ -325,6 +330,8 @@ export interface SoftDeleteCallbackOptions {
  * rejects when the resolved user has deletedAt set:
  *
  * ```typescript
+ * import { APIError } from "better-auth/api";
+ *
  * databaseHooks: {
  *   session: {
  *     create: {
@@ -357,7 +364,14 @@ export interface SoftDeleteCallbackOptions {
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
- *           await auth.api.revokeUserSessions({ body: { userId } });
+ *           // The internal adapter works in the self-service deleteUser
+ *           // flow and clears secondaryStorage itself. Do NOT use
+ *           // auth.api.revokeUserSessions -- that endpoint exists only
+ *           // with the admin() plugin and requires an authenticated
+ *           // ADMIN session, which the user deleting their own account
+ *           // does not have.
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
  *         },
  *         writeAuditEntry: async (entry) => {
  *           await db.insert(auditLog).values({ ...entry, id: uuidv7() });
