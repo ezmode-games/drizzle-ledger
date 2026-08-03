@@ -141,10 +141,16 @@ const softDelete = createSoftDeleteCallback({
     // deleteUserSessions(userId); before the split, deleteSessions
     // accepted a userId directly -- and on post-split versions
     // deleteSessions(userId) SILENTLY DELETES NOTHING (it now takes
-    // arrays of session tokens). Feature-detect:
+    // arrays of session tokens). Feature-detect at runtime; the local
+    // type widening keeps both branches compiling on either version's
+    // shipped types (they disagree on which methods exist and their
+    // parameter shapes).
     const ctx = await auth.$context;
-    const ia = ctx.internalAdapter;
-    if ("deleteUserSessions" in ia) {
+    const ia = ctx.internalAdapter as {
+      deleteUserSessions?: (userId: string) => Promise<void>;
+      deleteSessions: (value: string | string[]) => Promise<void>;
+    };
+    if (ia.deleteUserSessions) {
       await ia.deleteUserSessions(userId);
     } else {
       await ia.deleteSessions(userId);

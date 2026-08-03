@@ -23,8 +23,23 @@
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
+ *           // Feature-detect: better-auth split the internal session
+ *           // API mid-1.6 (deleteUserSessions(userId) vs the pre-split
+ *           // deleteSessions(userId)); on post-split versions a userId
+ *           // passed to deleteSessions SILENTLY DELETES NOTHING. The
+ *           // local type widening exists because the two better-auth
+ *           // type generations disagree -- it keeps both branches
+ *           // compiling on either version.
  *           const ctx = await auth.$context;
- *           await ctx.internalAdapter.deleteUserSessions(userId);
+ *           const ia = ctx.internalAdapter as {
+ *             deleteUserSessions?: (userId: string) => Promise<void>;
+ *             deleteSessions: (value: string | string[]) => Promise<void>;
+ *           };
+ *           if (ia.deleteUserSessions) {
+ *             await ia.deleteUserSessions(userId);
+ *           } else {
+ *             await ia.deleteSessions(userId);
+ *           }
  *         },
  *       }),
  *     },
@@ -452,10 +467,15 @@ export interface SoftDeleteCallbackOptions {
  *           // Late 1.6.x has deleteUserSessions(userId); before the
  *           // split, deleteSessions accepted a userId directly -- and on
  *           // post-split versions deleteSessions(userId) SILENTLY
- *           // DELETES NOTHING (it now takes session-token arrays).
+ *           // DELETES NOTHING (it now takes session-token arrays). The
+ *           // local type widening keeps both branches compiling on
+ *           // either version's shipped types.
  *           const ctx = await auth.$context;
- *           const ia = ctx.internalAdapter;
- *           if ("deleteUserSessions" in ia) {
+ *           const ia = ctx.internalAdapter as {
+ *             deleteUserSessions?: (userId: string) => Promise<void>;
+ *             deleteSessions: (value: string | string[]) => Promise<void>;
+ *           };
+ *           if (ia.deleteUserSessions) {
  *             await ia.deleteUserSessions(userId);
  *           } else {
  *             await ia.deleteSessions(userId);
