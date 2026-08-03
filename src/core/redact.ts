@@ -52,6 +52,14 @@ function redactValue(value: unknown, loweredPatterns: string[]): unknown {
     return value.map((item) => redactValue(item, loweredPatterns));
   }
 
+  // Date instances pass through intact. Rebuilding them via
+  // Object.entries would flatten them to {} (no own enumerable
+  // properties) -- and better-auth rows carry live Date fields
+  // (createdAt, accessTokenExpiresAt) on every audit write.
+  if (value instanceof Date) {
+    return value;
+  }
+
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {

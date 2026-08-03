@@ -12,16 +12,33 @@ export interface PurgeConfig {
   piiFields?: string[];
   /** Replacement value for userId (default: 'PURGED_USER') */
   anonymizedUserId?: string;
+  /**
+   * Audit entries about records the user OWNS, keyed by table.
+   * Matching by userId/recordId alone misses entries where an admin or
+   * system acted on the user's records (userId = admin, recordId = the
+   * record's own id) -- those entries keep the user's data unless listed
+   * here. Only the caller can resolve ownership; the audit log does not
+   * know the app's schema.
+   */
+  ownedRecords?: { tableName: string; recordIds: string[] }[];
 }
 
 /**
  * Result of a GDPR purge operation.
  */
 export interface PurgeResult {
-  /** Number of audit entries anonymized */
+  /** Number of audit entries updated by the purge */
   entriesAnonymized: number;
   /** Tables that had audit entries anonymized */
   tablesProcessed: string[];
+  /**
+   * Entries with at least one JSON column that could not be parsed and
+   * was left byte-for-byte untouched. Informational and OVERLAPPING with
+   * entriesAnonymized: such an entry still gets its userId/ip/userAgent
+   * scrubbed (and counts as anonymized) -- this counter flags that its
+   * unreadable JSON may retain PII and needs manual attention.
+   */
+  entriesSkipped: number;
 }
 
 /**
@@ -83,13 +100,30 @@ function anonymizeValue(value: unknown, loweredFields: Set<string>): unknown {
     return value.map((item) => anonymizeValue(item, loweredFields));
   }
 
+  // Date instances pass through intact: rebuilding them via
+  // Object.entries would flatten them to {}. Audit-log callers only
+  // ever pass JSON.parse output (no Dates), but this function is
+  // exported for standalone use on live objects.
+  if (value instanceof Date) {
+    return value;
+  }
+
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {
       if (loweredFields.has(key.toLowerCase())) {
         continue;
       }
-      result[key] = anonymizeValue(entry, loweredFields);
+      // defineProperty, not assignment: a JSON key literally named
+      // "__proto__" survives JSON.parse as an own property, but plain
+      // assignment would invoke the inherited setter -- swapping the
+      // result's prototype and silently dropping the data.
+      Object.defineProperty(result, key, {
+        value: anonymizeValue(entry, loweredFields),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
     return result;
   }

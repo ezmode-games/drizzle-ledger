@@ -2,11 +2,17 @@
  * Ledger GDPR - Drizzle Adapter
  *
  * Drizzle-coupled GDPR purge functions.
+ *
+ * Scope: the purge covers the AUDIT LOG only. The live user row and the
+ * app's domain tables are the caller's responsibility -- "GDPR
+ * compliance" from this module alone would be overclaiming.
  */
 
-import { eq, or } from "drizzle-orm";
+import { and, eq, inArray, or, type SQL } from "drizzle-orm";
+import { uuidv7 } from "uuidv7";
 import { anonymizeJsonData, DEFAULT_PII_FIELDS } from "../core/gdpr.js";
 import type { PurgeConfig, PurgeResult } from "../core/gdpr.js";
+import { getLedgerContext } from "../core/context.js";
 import type { AuditLog } from "./schema/sqlite.js";
 
 // Re-export pure helpers from core for convenience
@@ -49,37 +55,79 @@ function serializeAnonymized(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
-// Type for Drizzle database with update capability
+// Type for Drizzle database used by the purge
 // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle db type compatibility
-type DrizzleDb = { update: (table: any) => any; select: () => any };
+type DrizzleDb = {
+  // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle db type compatibility
+  update: (table: any) => any;
+  select: () => any;
+  // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle db type compatibility
+  insert: (table: any) => any;
+  // biome-ignore lint/suspicious/noExplicitAny: D1/libsql batch API
+  batch?: (statements: any[]) => Promise<unknown>;
+};
+
+/**
+ * Build the audit-entry match condition for a user: entries the user
+ * performed (userId), entries about the user's own record (recordId ==
+ * userId), and entries about records the user owns (ownedRecords, which
+ * catches admin/system actions on the user's data).
+ */
+function buildUserMatch(
+  auditTable: AuditLog,
+  userId: string,
+  ownedRecords: PurgeConfig["ownedRecords"],
+): SQL | undefined {
+  const conditions: (SQL | undefined)[] = [
+    eq(auditTable.userId, userId),
+    eq(auditTable.recordId, userId),
+  ];
+
+  for (const owned of ownedRecords ?? []) {
+    if (owned.recordIds.length === 0) {
+      continue;
+    }
+    conditions.push(
+      and(eq(auditTable.tableName, owned.tableName), inArray(auditTable.recordId, owned.recordIds)),
+    );
+  }
+
+  return or(...conditions);
+}
 
 /**
  * Anonymize all user data in audit logs.
  * Does NOT delete records - preserves audit trail with PII removed.
  *
  * This function:
- * 1. Finds all audit entries for the user (by userId OR recordId)
+ * 1. Finds all audit entries for the user: by userId (actions they
+ *    performed), by recordId == userId (their own record), and by
+ *    ownedRecords (their records acted on by admins/system)
  * 2. Replaces userId with anonymized value (only for entries created by the user)
  * 3. Nullifies ip and userAgent (only for entries created by the user)
- * 4. Removes PII fields from oldData/newData JSON
+ * 4. Removes PII fields from oldData/newData JSON; unparseable JSON is
+ *    left untouched and counted in entriesSkipped
  * 5. Preserves non-PII audit data (tableName, action, timestamps)
+ * 6. Executes all updates atomically via db.batch when the driver
+ *    provides it (D1/libsql); otherwise sequentially (NOT atomic --
+ *    a crash mid-purge leaves a partial purge; re-run to complete)
+ * 7. Writes one PURGE audit entry recording that the erasure happened
+ *    (counts only, no PII)
  *
  * @param db - Drizzle database instance
  * @param auditTable - The audit log table
  * @param userId - User ID to purge
  * @param config - Optional configuration
- * @returns Result with count of affected records
+ * @returns Result with counts of affected records
  *
  * @example
  * ```typescript
- * import { purgeUserData } from '@rafters/ledger/gdpr';
- * import { auditLog } from '@rafters/ledger';
+ * import { purgeUserData } from '@rafters/ledger/drizzle';
  *
  * const result = await purgeUserData(db, auditLog, 'user-123', {
- *   piiFields: ['email', 'name', 'ip', 'address', 'phone'],
+ *   piiFields: ['email', 'name', 'subject', 'body', 'to', 'from'],
+ *   ownedRecords: [{ tableName: 'messages', recordIds: userMessageIds }],
  * });
- *
- * console.log(`Anonymized ${result.entriesAnonymized} audit entries`);
  * ```
  */
 export async function purgeUserData(
@@ -91,25 +139,24 @@ export async function purgeUserData(
   const piiFields = config?.piiFields ?? DEFAULT_PII_FIELDS;
   const anonymizedUserId = config?.anonymizedUserId ?? DEFAULT_ANONYMIZED_USER_ID;
 
-  // Find all audit entries for this user
-  // Match by userId (who performed action) OR recordId (the user's record)
   const entries = await db
     .select()
     .from(auditTable)
-    .where(or(eq(auditTable.userId, userId), eq(auditTable.recordId, userId)));
+    .where(buildUserMatch(auditTable, userId, config?.ownedRecords));
 
   if (entries.length === 0) {
     return {
       entriesAnonymized: 0,
       tablesProcessed: [],
+      entriesSkipped: 0,
     };
   }
 
-  // Track unique tables processed
   const tablesProcessed = new Set<string>();
-  let entriesAnonymized = 0;
+  let entriesSkipped = 0;
+  // biome-ignore lint/suspicious/noExplicitAny: Drizzle statement builders
+  const statements: any[] = [];
 
-  // Process each entry
   for (const entry of entries) {
     tablesProcessed.add(entry.tableName);
 
@@ -118,6 +165,10 @@ export async function purgeUserData(
     const oldParsed = parseStoredJson(entry.oldData);
     const newParsed = parseStoredJson(entry.newData);
 
+    if (!oldParsed.ok || !newParsed.ok) {
+      entriesSkipped++;
+    }
+
     const anonymizedOldData = oldParsed.ok
       ? serializeAnonymized(anonymizeJsonData(oldParsed.value, piiFields))
       : entry.oldData;
@@ -125,40 +176,83 @@ export async function purgeUserData(
       ? serializeAnonymized(anonymizeJsonData(newParsed.value, piiFields))
       : entry.newData;
 
-    // Update the entry
     // Only anonymize userId/ip/userAgent when entry.userId matches the purged user
     // This preserves admin PII when they modified the user's record
-    // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle ORM dynamic operations
-    await (db.update(auditTable) as any)
-      .set({
-        userId: entry.userId === userId ? anonymizedUserId : entry.userId,
-        ip: entry.userId === userId ? null : entry.ip,
-        userAgent: entry.userId === userId ? null : entry.userAgent,
-        oldData: anonymizedOldData,
-        newData: anonymizedNewData,
-      })
-      .where(eq(auditTable.id, entry.id));
-
-    entriesAnonymized++;
+    statements.push(
+      // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle ORM dynamic operations
+      (db.update(auditTable) as any)
+        .set({
+          userId: entry.userId === userId ? anonymizedUserId : entry.userId,
+          ip: entry.userId === userId ? null : entry.ip,
+          userAgent: entry.userId === userId ? null : entry.userAgent,
+          oldData: anonymizedOldData,
+          newData: anonymizedNewData,
+        })
+        .where(eq(auditTable.id, entry.id)),
+    );
   }
 
-  return {
-    entriesAnonymized,
+  const result: PurgeResult = {
+    entriesAnonymized: entries.length,
     tablesProcessed: Array.from(tablesProcessed),
+    entriesSkipped,
   };
+
+  // Record that the erasure happened: counts only, no PII, recordId is
+  // the anonymized placeholder (storing the purged user's real id here
+  // would itself retain the identifier the purge removes).
+  statements.push(
+    // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle ORM dynamic operations
+    (db.insert(auditTable) as any).values({
+      id: uuidv7(),
+      tableName: "audit_log",
+      recordId: anonymizedUserId,
+      action: "PURGE",
+      oldData: null,
+      newData: JSON.stringify(result),
+      userId: getLedgerContext()?.userId ?? null,
+      ip: null,
+      userAgent: null,
+      endpoint: getLedgerContext()?.endpoint ?? null,
+      requestId: getLedgerContext()?.requestId ?? null,
+      createdAt: new Date(),
+    }),
+  );
+
+  if (typeof db.batch === "function") {
+    // All-or-nothing where the driver supports it (D1, libsql).
+    await db.batch(statements);
+  } else {
+    for (const statement of statements) {
+      await statement;
+    }
+  }
+
+  return result;
 }
 
 /**
- * Check if a user's data has already been purged.
- * Useful for idempotency checks.
+ * Check whether audit entries still ATTRIBUTE actions to this user.
+ * Useful for idempotency checks before/after purgeUserData.
+ *
+ * Limitation, by design: this checks the userId column only. The purge
+ * never rewrites recordId in ANY case -- not for ownedRecords matches,
+ * not even for the user's own row -- it anonymizes content in place.
+ * So any predicate containing recordId-based matching returns non-empty
+ * forever after a successful purge, and cannot distinguish
+ * purged-from-unpurged. Content-level verification post-hoc is not
+ * possible from the rows alone. The PURGE audit entry is the record
+ * that the erasure ran; note each re-run appends another PURGE entry
+ * (each run is its own recorded erasure event), so gate re-runs on this
+ * function.
  *
  * @param db - Drizzle database instance
  * @param auditTable - The audit log table
  * @param userId - User ID to check
- * @returns true if no audit entries exist with this userId
+ * @returns true if no audit entries carry this userId
  */
 export async function isUserDataPurged(
-  db: DrizzleDb,
+  db: Pick<DrizzleDb, "select">,
   auditTable: AuditLog,
   userId: string,
 ): Promise<boolean> {

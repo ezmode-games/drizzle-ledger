@@ -25,6 +25,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -89,6 +90,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -122,6 +124,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue([]),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn(),
     };
 
@@ -188,6 +191,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockReturnValue({
           where: vi.fn().mockResolvedValue(undefined),
@@ -234,6 +238,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -283,6 +288,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -307,10 +313,376 @@ describe("purgeUserData", () => {
     );
 
     expect(result.entriesAnonymized).toBe(1);
+    // Unreadable JSON is flagged for manual attention
+    expect(result.entriesSkipped).toBe(1);
     // Malformed JSON is left byte-for-byte untouched, never destroyed
     expect(updatedValues[0].oldData).toBe("not valid json");
     // Valid JSON is anonymized
     expect(updatedValues[0].newData).toBe('{"valid":"json"}');
+  });
+
+  test("scalar JSON payloads round-trip as their JSON text, not null", async () => {
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "counters",
+        recordId: "user-123",
+        action: "UPDATE",
+        oldData: "0",
+        newData: "false",
+        userId: "user-123",
+        ip: "1.2.3.4",
+        userAgent: "UA",
+        createdAt: new Date(),
+      },
+    ];
+
+    const updatedValues: Record<string, unknown>[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          updatedValues.push(values);
+          return {
+            where: vi.fn().mockResolvedValue(undefined),
+          };
+        }),
+      }),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    // Falsy-but-valid scalars must not collapse to SQL NULL
+    expect(updatedValues[0].oldData).toBe("0");
+    expect(updatedValues[0].newData).toBe("false");
+  });
+
+  test("writes one PURGE audit entry recording the erasure, counts only", async () => {
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "users",
+        recordId: "user-123",
+        action: "UPDATE",
+        oldData: JSON.stringify({ email: "x@test.com" }),
+        newData: null,
+        userId: "user-123",
+        ip: "1.2.3.4",
+        userAgent: "UA",
+        createdAt: new Date(),
+      },
+    ];
+
+    const insertedValues: Record<string, unknown>[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          insertedValues.push(values);
+          return Promise.resolve();
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    expect(insertedValues).toHaveLength(1);
+    const purgeEntry = insertedValues[0];
+    expect(purgeEntry.action).toBe("PURGE");
+    expect(purgeEntry.tableName).toBe("audit_log");
+    // recordId is the anonymized placeholder -- storing the real id would
+    // retain the identifier the purge removes
+    expect(purgeEntry.recordId).toBe("PURGED_USER");
+    const purgeReport = JSON.parse(purgeEntry.newData as string);
+    expect(purgeReport.entriesAnonymized).toBe(1);
+    expect(JSON.stringify(purgeEntry)).not.toContain("user-123");
+    expect(JSON.stringify(purgeEntry)).not.toContain("x@test.com");
+  });
+
+  test("no PURGE entry when nothing matched", async () => {
+    const insertSpy = vi.fn();
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([]),
+        }),
+      }),
+      insert: insertSpy,
+      update: vi.fn(),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    const result = await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "ghost-user",
+    );
+
+    expect(result.entriesSkipped).toBe(0);
+    expect(insertSpy).not.toHaveBeenCalled();
+  });
+
+  test("executes atomically via db.batch when the driver provides it", async () => {
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "users",
+        recordId: "user-123",
+        action: "UPDATE",
+        oldData: null,
+        newData: null,
+        userId: "user-123",
+        ip: null,
+        userAgent: null,
+        createdAt: new Date(),
+      },
+      {
+        id: "entry-2",
+        tableName: "users",
+        recordId: "user-123",
+        action: "UPDATE",
+        oldData: null,
+        newData: null,
+        userId: "user-123",
+        ip: null,
+        userAgent: null,
+        createdAt: new Date(),
+      },
+    ];
+
+    const whereSpy = vi.fn().mockReturnValue({ kind: "update-statement" });
+    const batchSpy = vi.fn().mockResolvedValue(undefined);
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockReturnValue({ kind: "insert-statement" }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({ where: whereSpy }),
+      }),
+      batch: batchSpy,
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    // One batch call containing every update statement plus the PURGE insert
+    expect(batchSpy).toHaveBeenCalledTimes(1);
+    const statements = batchSpy.mock.calls[0][0];
+    expect(statements).toHaveLength(3);
+  });
+
+  test("admin-edited message reached via ownedRecords: content scrubbed, admin identity preserved", async () => {
+    // The AC1 scenario end-to-end: entry written by an admin about the
+    // user's message -- unreachable by userId/recordId matching, reached
+    // only via ownedRecords -- gets its JSON anonymized while the
+    // admin's identity fields survive.
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "messages",
+        recordId: "msg-1",
+        action: "UPDATE",
+        oldData: JSON.stringify({ subject: "hi", body: "full email body", email: "u@test.com" }),
+        newData: JSON.stringify({ subject: "hi", body: "edited body", email: "u@test.com" }),
+        userId: "admin-456",
+        ip: "10.0.0.1",
+        userAgent: "AdminUA",
+        createdAt: new Date(),
+      },
+    ];
+
+    const updatedValues: Record<string, unknown>[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          updatedValues.push(values);
+          return {
+            where: vi.fn().mockResolvedValue(undefined),
+          };
+        }),
+      }),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+      tableName: { name: "table_name" },
+    };
+
+    const result = await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+      {
+        piiFields: ["email", "subject", "body"],
+        ownedRecords: [{ tableName: "messages", recordIds: ["msg-1"] }],
+      },
+    );
+
+    expect(result.entriesAnonymized).toBe(1);
+    // Message content scrubbed
+    const newData = JSON.parse(updatedValues[0].newData as string);
+    expect(newData.body).toBeUndefined();
+    expect(newData.subject).toBeUndefined();
+    expect(newData.email).toBeUndefined();
+    // Admin identity preserved -- they are not the purged user
+    expect(updatedValues[0].userId).toBe("admin-456");
+    expect(updatedValues[0].ip).toBe("10.0.0.1");
+    expect(updatedValues[0].userAgent).toBe("AdminUA");
+  });
+
+  test("each re-run appends its own PURGE entry -- gate on isUserDataPurged", async () => {
+    const insertedValues: Record<string, unknown>[] = [];
+    const makeDb = (entries: unknown[]) => ({
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(entries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          insertedValues.push(values);
+          return Promise.resolve();
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    });
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    // recordId-matched entries survive the first purge (recordId is
+    // never rewritten), so a second run finds and re-processes them
+    const persistentEntry = {
+      id: "entry-1",
+      tableName: "users",
+      recordId: "user-123",
+      action: "UPDATE",
+      oldData: null,
+      newData: null,
+      userId: "PURGED_USER",
+      ip: null,
+      userAgent: null,
+      createdAt: new Date(),
+    };
+
+    await purgeUserData(
+      makeDb([persistentEntry]) as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+    await purgeUserData(
+      makeDb([persistentEntry]) as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    // Documented behavior: one PURGE entry per run
+    expect(insertedValues.filter((v) => v.action === "PURGE")).toHaveLength(2);
+  });
+
+  test("ownedRecords extends the match to records the user owns", async () => {
+    const whereConditions: unknown[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockImplementation((condition: unknown) => {
+            whereConditions.push(condition);
+            return Promise.resolve([]);
+          }),
+        }),
+      }),
+      insert: vi.fn(),
+      update: vi.fn(),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+      tableName: { name: "table_name" },
+    };
+
+    await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+      { ownedRecords: [{ tableName: "messages", recordIds: ["msg-1", "msg-2"] }] },
+    );
+
+    // The WHERE condition is a drizzle SQL object composed with the
+    // ownership clause; serialize its chunks to prove inclusion.
+    expect(whereConditions).toHaveLength(1);
+    const conditionText = JSON.stringify(whereConditions[0]);
+    expect(conditionText).toContain("msg-1");
+    expect(conditionText).toContain("msg-2");
   });
 
   test("preserves array-shaped JSON payloads as arrays", async () => {
@@ -336,6 +708,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -387,6 +760,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntries),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
           updatedValues.push(values);
@@ -438,6 +812,7 @@ describe("purgeUserData", () => {
           where: vi.fn().mockResolvedValue(mockEntriesFirstRun),
         }),
       }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
       update: vi.fn().mockReturnValue({
         set: vi.fn().mockReturnValue({
           where: vi.fn().mockResolvedValue(undefined),
