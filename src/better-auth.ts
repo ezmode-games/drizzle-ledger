@@ -41,6 +41,7 @@
  */
 
 import type { BetterAuthPlugin, User } from "better-auth";
+import { getLedgerContext } from "./core/context.js";
 import { softDeleteValues } from "./core/soft-delete.js";
 import { SoftDeletePerformedError, isSoftDeletePerformed } from "./core/errors.js";
 import { redactSensitiveFields } from "./core/redact.js";
@@ -131,6 +132,23 @@ type UserWithId = { id: string } & Record<string, unknown>;
  * - Audit logging for user and account create/update operations via databaseHooks
  * - Optional delete audit logging when softDeleteTables includes 'user'
  *
+ * ATTRIBUTION REQUIRES CONTEXT: entries attribute to the authenticated
+ * principal from AsyncLocalStorage. Wrap request handling in
+ * runWithLedgerContext or every actor is null (except self-signup):
+ *
+ * ```typescript
+ * // Hono middleware, before the auth handler
+ * app.use(async (c, next) => {
+ *   return runWithLedgerContext(
+ *     createLedgerContext({
+ *       userId: c.get("user")?.id ?? null,
+ *       endpoint: `${c.req.method} ${c.req.path}`,
+ *     }),
+ *     next,
+ *   );
+ * });
+ * ```
+ *
  * NOTE: This plugin only provides audit logging. For actual soft-delete behavior
  * (updating deletedAt instead of hard deleting), use createSoftDeleteCallback
  * with the user.deleteUser.beforeDelete option.
@@ -181,11 +199,33 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
     }
   }
 
+  /**
+   * Resolve the acting principal for an audit entry.
+   * The authenticated actor from ledger context (runWithLedgerContext
+   * middleware) always wins; without context the actor is unknown --
+   * NEVER default to the target row's id, which recorded an admin
+   * banning a user as the user acting on themselves. The one exception
+   * is user self-creation (signup), where the created user genuinely is
+   * the actor and no context exists yet.
+   */
+  function resolveActor(fallback: string | null = null): string | null {
+    return getLedgerContext()?.userId ?? fallback;
+  }
+
   // Build databaseHooks based on audited tables
   // biome-ignore lint/suspicious/noExplicitAny: Required for better-auth databaseHooks typing
   const databaseHooks: Record<string, any> = {};
 
   for (const table of auditTables) {
+    // Pair update.before change sets with update.after results.
+    // better-auth's after hook has no access to the previous row, and
+    // the before hook has no row id -- so pairing is FIFO within this
+    // isolate: best-effort, correct for the sequential per-request flow
+    // better-auth runs hooks in, and the entry shape ({ changed })
+    // makes the provenance explicit rather than pretending to be a
+    // full before-image.
+    const pendingChangeSets: Record<string, unknown>[] = [];
+
     databaseHooks[table] = {
       create: {
         after: async (data: UserWithId) => {
@@ -195,19 +235,29 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
             action: "INSERT",
             oldData: null,
             newData: data as Record<string, unknown>,
-            userId: table === "user" ? data.id : null,
+            // Self-signup: the created user is the actor when no
+            // authenticated context exists (there is no session yet).
+            userId: resolveActor(table === "user" ? data.id : null),
           });
         },
       },
       update: {
+        before: async (data: Record<string, unknown>) => {
+          pendingChangeSets.push({ ...data });
+          return { data };
+        },
         after: async (data: UserWithId) => {
+          const changed = pendingChangeSets.shift() ?? null;
           await audit({
             tableName: table,
             recordId: data.id,
             action: "UPDATE",
-            oldData: null, // We don't have access to old data in after hook
+            // Not a full before-image (better-auth does not expose the
+            // previous row); { changed } is the incoming change set
+            // captured by update.before.
+            oldData: changed ? { changed } : null,
             newData: data as Record<string, unknown>,
-            userId: table === "user" ? data.id : null,
+            userId: resolveActor(),
           });
         },
       },
@@ -224,14 +274,16 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
   const userDeleteHooks = softDeleteTables.includes("user")
     ? {
         beforeDelete: async (user: User) => {
-          // Log the soft-delete intent
+          // Log the soft-delete intent. Self-service deletion is the
+          // common flow, so the target is the fallback actor; an
+          // authenticated context (admin deleting a user) wins.
           await audit({
             tableName: "user",
             recordId: user.id,
             action: "SOFT_DELETE",
             oldData: user as unknown as Record<string, unknown>,
             newData: null,
-            userId: user.id,
+            userId: resolveActor(user.id),
           });
         },
       }
