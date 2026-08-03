@@ -325,6 +325,7 @@ describe("createAuditedDb", () => {
     // the raw builder, and execute() rejects.
     const chain: Record<string, unknown> = {};
     chain.where = vi.fn(() => chain);
+    // oxlint-disable-next-line no-thenable -- intentionally thenable mock
     chain.then = function (
       this: unknown,
       onFulfilled?: (v: unknown) => unknown,
