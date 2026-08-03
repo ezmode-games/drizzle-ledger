@@ -100,6 +100,14 @@ function anonymizeValue(value: unknown, loweredFields: Set<string>): unknown {
     return value.map((item) => anonymizeValue(item, loweredFields));
   }
 
+  // Date instances pass through intact: rebuilding them via
+  // Object.entries would flatten them to {}. Audit-log callers only
+  // ever pass JSON.parse output (no Dates), but this function is
+  // exported for standalone use on live objects.
+  if (value instanceof Date) {
+    return value;
+  }
+
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
     for (const [key, entry] of Object.entries(value)) {

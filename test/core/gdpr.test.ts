@@ -110,6 +110,17 @@ describe("anonymizeJsonData", () => {
     expect(result).toEqual({ batches: [[{ id: "1" }], [{ id: "2" }]] });
   });
 
+  test("Date instances round-trip intact, not flattened to {}", () => {
+    const createdAt = new Date("2026-08-02T12:00:00Z");
+    const result = anonymizeJsonData({ id: "1", createdAt, email: "x@t.co" }, ["email"]) as Record<
+      string,
+      unknown
+    >;
+
+    expect(result.createdAt).toBe(createdAt);
+    expect(JSON.stringify(result)).toContain("2026-08-02T12:00:00.000Z");
+  });
+
   test("passes primitives through unchanged", () => {
     expect(anonymizeJsonData("a string", ["email"])).toBe("a string");
     expect(anonymizeJsonData(42, ["email"])).toBe(42);
