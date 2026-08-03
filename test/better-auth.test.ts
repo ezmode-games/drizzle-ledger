@@ -110,7 +110,7 @@ describe("ledgerPlugin", () => {
     expect(entries[0]?.recordId).toBe("user-456");
   });
 
-  test("update.before change set is paired into oldData as { changed }", async () => {
+  test("update.before change set is paired into oldData as { changed } within a context", async () => {
     const entries: LedgerAuditEntry[] = [];
     const plugin = ledgerPlugin({
       writeAuditEntry: (entry) => {
@@ -122,12 +122,117 @@ describe("ledgerPlugin", () => {
     const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
     const userHooks = result?.options?.databaseHooks?.user;
 
-    await userHooks?.update?.before?.({ name: "New Name" });
-    await userHooks?.update?.after?.({ id: "user-9", name: "New Name", email: "e@test.com" });
+    await runWithLedgerContext(createLedgerContext({ userId: "admin-1" }), async () => {
+      await userHooks?.update?.before?.({ name: "New Name" });
+      await userHooks?.update?.after?.({ id: "user-9", name: "New Name", email: "e@test.com" });
+    });
 
     expect(entries).toHaveLength(1);
     expect(entries[0]?.oldData).toEqual({ changed: { name: "New Name" } });
     expect(entries[0]?.newData).toMatchObject({ id: "user-9", name: "New Name" });
+  });
+
+  test("update.before returns nothing -- never echoes data back into the hook merge", async () => {
+    const plugin = ledgerPlugin({ writeAuditEntry: () => Promise.resolve() });
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    // better-auth merges a hook's returned data over the accumulated
+    // payload; returning { data } would revert other hooks' mutations.
+    const returned = await runWithLedgerContext(
+      createLedgerContext({ userId: "admin-1" }),
+      async () => userHooks?.update?.before?.({ name: "X" }),
+    );
+
+    expect(returned).toBeUndefined();
+  });
+
+  test("concurrent contexts never cross-pair change sets", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    const ctxA = createLedgerContext({ userId: "actor-a" });
+    const ctxB = createLedgerContext({ userId: "actor-b" });
+
+    // Interleave: both befores run, then the afters resolve in REVERSE
+    // order (B's DB write finishes first) -- the plugin-lifetime FIFO
+    // this replaces would have paired B's entry with A's change set.
+    await runWithLedgerContext(ctxA, async () => {
+      await userHooks?.update?.before?.({ name: "change-A" });
+    });
+    await runWithLedgerContext(ctxB, async () => {
+      await userHooks?.update?.before?.({ name: "change-B" });
+    });
+    await runWithLedgerContext(ctxB, async () => {
+      await userHooks?.update?.after?.({ id: "user-b", name: "change-B" });
+    });
+    await runWithLedgerContext(ctxA, async () => {
+      await userHooks?.update?.after?.({ id: "user-a", name: "change-A" });
+    });
+
+    expect(entries).toHaveLength(2);
+    const entryB = entries.find((e) => e.recordId === "user-b");
+    const entryA = entries.find((e) => e.recordId === "user-a");
+    expect(entryB?.oldData).toEqual({ changed: { name: "change-B" } });
+    expect(entryB?.userId).toBe("actor-b");
+    expect(entryA?.oldData).toEqual({ changed: { name: "change-A" } });
+    expect(entryA?.userId).toBe("actor-a");
+  });
+
+  test("an abandoned before-capture dies with its context -- no cross-request desync", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    // Request 1: before fires but the update fails/is vetoed -- after
+    // never runs. The capture is stranded in request 1's context only.
+    await runWithLedgerContext(createLedgerContext({ userId: "actor-1" }), async () => {
+      await userHooks?.update?.before?.({ name: "doomed-change" });
+    });
+
+    // Request 2: a fresh context pairs its own change set correctly.
+    await runWithLedgerContext(createLedgerContext({ userId: "actor-2" }), async () => {
+      await userHooks?.update?.before?.({ name: "clean-change" });
+      await userHooks?.update?.after?.({ id: "user-2", name: "clean-change" });
+    });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.oldData).toEqual({ changed: { name: "clean-change" } });
+    expect(entries[0]?.oldData).not.toEqual({ changed: { name: "doomed-change" } });
+  });
+
+  test("update hooks without any ledger context capture nothing and pair nothing", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    await userHooks?.update?.before?.({ name: "uncaptured" });
+    await userHooks?.update?.after?.({ id: "user-n", name: "uncaptured" });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.oldData).toBeNull();
   });
 
   test("create with an authenticated context attributes to the context actor", async () => {

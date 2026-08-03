@@ -42,6 +42,7 @@
 
 import type { BetterAuthPlugin, User } from "better-auth";
 import { getLedgerContext } from "./core/context.js";
+import type { LedgerContext } from "./core/types.js";
 import { softDeleteValues } from "./core/soft-delete.js";
 import { SoftDeletePerformedError, isSoftDeletePerformed } from "./core/errors.js";
 import { redactSensitiveFields } from "./core/redact.js";
@@ -216,16 +217,24 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
   // biome-ignore lint/suspicious/noExplicitAny: Required for better-auth databaseHooks typing
   const databaseHooks: Record<string, any> = {};
 
-  for (const table of auditTables) {
-    // Pair update.before change sets with update.after results.
-    // better-auth's after hook has no access to the previous row, and
-    // the before hook has no row id -- so pairing is FIFO within this
-    // isolate: best-effort, correct for the sequential per-request flow
-    // better-auth runs hooks in, and the entry shape ({ changed })
-    // makes the provenance explicit rather than pretending to be a
-    // full before-image.
-    const pendingChangeSets: Record<string, unknown>[] = [];
+  // Pair update.before change sets with update.after results, keyed by
+  // the request's LedgerContext object (per-table queue per context).
+  // better-auth's after hook has no access to the previous row and the
+  // before hook has no row id, so exact pairing is impossible from the
+  // hook surface. Keying by context confines pairing to one request:
+  // concurrent requests in the same isolate can never cross-pair, and
+  // an abandoned capture (a failed or vetoed update) dies with its
+  // context instead of desyncing the plugin forever. Within one
+  // request the queue is FIFO -- multiple updates to the same table in
+  // a single request pair in order, and a veto mid-request can still
+  // offset later pairs in THAT request; the { changed } entry shape
+  // keeps the provenance explicit rather than pretending to be a full
+  // before-image. Without a ledger context no capture happens and
+  // oldData stays null -- change-set capture, like attribution,
+  // requires runWithLedgerContext.
+  const pendingChangeSets = new WeakMap<LedgerContext, Record<string, Record<string, unknown>[]>>();
 
+  for (const table of auditTables) {
     databaseHooks[table] = {
       create: {
         after: async (data: UserWithId) => {
@@ -243,18 +252,30 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
       },
       update: {
         before: async (data: Record<string, unknown>) => {
-          pendingChangeSets.push({ ...data });
-          return { data };
+          const context = getLedgerContext();
+          if (context) {
+            const byTable = pendingChangeSets.get(context) ?? {};
+            (byTable[table] ??= []).push({ ...data });
+            pendingChangeSets.set(context, byTable);
+          }
+          // Return nothing: echoing { data } back would overwrite
+          // mutations other before-hooks made -- better-auth merges
+          // each hook's returned data onto the accumulator, and this
+          // hook receives the ORIGINAL payload, not the accumulated
+          // one. undefined skips the merge entirely.
         },
         after: async (data: UserWithId) => {
-          const changed = pendingChangeSets.shift() ?? null;
+          const context = getLedgerContext();
+          const changed = context
+            ? (pendingChangeSets.get(context)?.[table]?.shift() ?? null)
+            : null;
           await audit({
             tableName: table,
             recordId: data.id,
             action: "UPDATE",
             // Not a full before-image (better-auth does not expose the
             // previous row); { changed } is the incoming change set
-            // captured by update.before.
+            // captured by update.before within this request's context.
             oldData: changed ? { changed } : null,
             newData: data as Record<string, unknown>,
             userId: resolveActor(),
