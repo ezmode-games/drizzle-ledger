@@ -8,7 +8,7 @@ pnpm add @rafters/ledger
 
 Peer dependency: `drizzle-orm >= 0.30.0`
 
-Two entry points: `@rafters/ledger` for the ORM-agnostic core (context, pure helpers, GDPR utilities), and `@rafters/ledger/drizzle` for the Drizzle adapter (schema, `createAuditedDb`, query filters, logging). Dialect-specific column definitions live at `@rafters/ledger/drizzle/soft-delete/sqlite`, `/pg`, and `/mysql`.
+Two entry points: `@rafters/ledger` for the ORM-agnostic core (context, pure helpers, always-on secret redaction, GDPR utilities), and `@rafters/ledger/drizzle` for the Drizzle adapter (schema, `createAuditedDb`, query filters, logging). Dialect-specific column definitions live at `@rafters/ledger/drizzle/soft-delete/sqlite`, `/pg`, and `/mysql`.
 
 ## Docs
 

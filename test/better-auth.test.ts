@@ -30,7 +30,9 @@ describe("ledgerPlugin", () => {
 
     expect(result?.options?.databaseHooks).toBeDefined();
     expect(result?.options?.databaseHooks?.user).toBeDefined();
-    expect(result?.options?.databaseHooks?.account).toBeDefined();
+    // account is opt-in since the redaction/default change: its rows
+    // carry OAuth tokens and are not audited unless explicitly listed
+    expect(result?.options?.databaseHooks?.account).toBeUndefined();
   });
 
   test("databaseHooks for user create calls writeAuditEntry", async () => {
@@ -84,9 +86,10 @@ describe("ledgerPlugin", () => {
     });
   });
 
-  test("databaseHooks for account calls writeAuditEntry", async () => {
+  test("databaseHooks for account calls writeAuditEntry when opted in", async () => {
     const entries: LedgerAuditEntry[] = [];
     const plugin = ledgerPlugin({
+      auditTables: ["user", "account"],
       writeAuditEntry: (entry) => {
         entries.push(entry);
         return Promise.resolve();
@@ -156,6 +159,34 @@ describe("ledgerPlugin", () => {
     });
   });
 
+  test("fail-closed: an entry that cannot be redacted is never written", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const writeSpy = vi.fn().mockResolvedValue(undefined);
+    const plugin = ledgerPlugin({ writeAuditEntry: writeSpy });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    // Object.entries invokes getters; a throwing getter makes redaction fail
+    const poisoned: Record<string, unknown> = { id: "user-x" };
+    Object.defineProperty(poisoned, "boobyTrap", {
+      enumerable: true,
+      get() {
+        throw new Error("redaction cannot read this");
+      },
+    });
+
+    await expect(userHooks?.create?.after?.(poisoned)).resolves.toBeUndefined();
+
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Redaction failed"),
+      expect.any(Error),
+    );
+
+    consoleSpy.mockRestore();
+  });
+
   test("handles writeAuditEntry errors gracefully", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -176,6 +207,81 @@ describe("ledgerPlugin", () => {
     expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("[ledger]"), expect.any(Error));
 
     consoleSpy.mockRestore();
+  });
+
+  test("redacts token/secret/password fields from account entries", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      auditTables: ["account"],
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const accountHooks = result?.options?.databaseHooks?.account;
+
+    await accountHooks?.create?.after?.({
+      id: "acc-1",
+      userId: "user-1",
+      providerId: "github",
+      accessToken: "gho_live_access_token",
+      refreshToken: "ghr_live_refresh_token",
+      idToken: "eyJ_id_token",
+      password: "argon2id$hash",
+      accessTokenExpiresAt: "2027-01-01",
+    });
+
+    expect(entries).toHaveLength(1);
+    const serialized = JSON.stringify(entries[0]);
+    expect(serialized).not.toContain("gho_live_access_token");
+    expect(serialized).not.toContain("ghr_live_refresh_token");
+    expect(serialized).not.toContain("eyJ_id_token");
+    expect(serialized).not.toContain("argon2id$hash");
+    // Non-secret fields survive
+    expect(entries[0]?.newData).toMatchObject({ id: "acc-1", providerId: "github" });
+    expect(entries[0]?.newData?.accessToken).toBe("[REDACTED]");
+  });
+
+  test("redaction handles nested payloads and case variants", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    await userHooks?.create?.after?.({
+      id: "user-1",
+      profile: { ApiKey: "sk-live-123", nested: [{ CLIENT_SECRET: "shh" }] },
+    });
+
+    const serialized = JSON.stringify(entries[0]);
+    expect(serialized).not.toContain("sk-live-123");
+    expect(serialized).not.toContain("shh");
+  });
+
+  test("respects extra redactPatterns", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const plugin = ledgerPlugin({
+      redactPatterns: ["ssn"],
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const result = plugin.init?.({} as unknown as Parameters<NonNullable<typeof plugin.init>>[0]);
+    const userHooks = result?.options?.databaseHooks?.user;
+
+    await userHooks?.create?.after?.({ id: "user-1", ssn: "123-45-6789" });
+
+    expect(JSON.stringify(entries[0])).not.toContain("123-45-6789");
   });
 
   test("works without writeAuditEntry (no-op)", async () => {
@@ -277,6 +383,46 @@ describe("createSoftDeleteCallback", () => {
     });
   });
 
+  test("redacts secret fields in the soft-delete audit entry", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const mockDb = {
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    };
+
+    const callback = createSoftDeleteCallback({
+      db: mockDb,
+      userTable: { id: {}, deletedAt: {}, deletedBy: {} },
+      whereUserId: (userId) => ({ id: userId }),
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const user = {
+      id: "user-1",
+      email: "x@test.com",
+      name: "X",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      emailVerified: false,
+      image: null,
+      twoFactorSecret: "otp-secret-value",
+    };
+
+    try {
+      await callback(user as unknown as Parameters<typeof callback>[0]);
+    } catch {
+      // Expected to throw SoftDeletePerformedError
+    }
+
+    expect(JSON.stringify(entries[0])).not.toContain("otp-secret-value");
+  });
+
   test("throws SoftDeletePerformedError with correct properties", async () => {
     const mockDb = {
       update: vi.fn().mockReturnValue({
@@ -343,6 +489,61 @@ describe("createDeleteAuditCallback", () => {
       action: "DELETE", // Hard delete action
       newData: null,
     });
+  });
+
+  test("redacts secret fields in the delete audit entry", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const callback = createDeleteAuditCallback((entry) => {
+      entries.push(entry);
+      return Promise.resolve();
+    });
+
+    const user = {
+      id: "user-1",
+      email: "x@test.com",
+      name: "X",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      emailVerified: false,
+      image: null,
+      twoFactorSecret: "otp-secret-value",
+    };
+
+    await expect(
+      callback(user as unknown as Parameters<typeof callback>[0]),
+    ).resolves.toBeUndefined();
+
+    expect(entries).toHaveLength(1);
+    expect(JSON.stringify(entries[0])).not.toContain("otp-secret-value");
+  });
+
+  test("fail-closed: unredactable entry is never written", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const writeSpy = vi.fn().mockResolvedValue(undefined);
+    const callback = createDeleteAuditCallback(writeSpy);
+
+    const poisoned: Record<string, unknown> = {
+      id: "user-1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    Object.defineProperty(poisoned, "boobyTrap", {
+      enumerable: true,
+      get() {
+        throw new Error("cannot read");
+      },
+    });
+
+    await expect(
+      callback(poisoned as unknown as Parameters<typeof callback>[0]),
+    ).resolves.toBeUndefined();
+
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Redaction failed"),
+      expect.any(Error),
+    );
+    consoleSpy.mockRestore();
   });
 
   test("handles errors gracefully", async () => {
