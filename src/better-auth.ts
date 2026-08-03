@@ -22,6 +22,10 @@
  *         db,
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
+ *         revokeSessions: async (userId) => {
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
+ *         },
  *       }),
  *     },
  *   },
@@ -275,6 +279,23 @@ export interface SoftDeleteCallbackOptions {
   // biome-ignore lint/suspicious/noExplicitAny: Required for Drizzle SQL type compatibility
   whereUserId: (userId: string) => any;
   /**
+   * Revoke ALL sessions for the user. REQUIRED.
+   *
+   * Soft-delete via beforeDelete aborts better-auth's own deleteUser
+   * cleanup, so nothing else revokes sessions: without this, a
+   * "deleted" user keeps every live session (cookie cache, KV-backed
+   * secondaryStorage, session rows) until natural expiry. Wire it to
+   * better-auth's INTERNAL adapter --
+   * (await auth.$context).internalAdapter.deleteSessions(userId) --
+   * which also clears secondaryStorage. Do not use
+   * auth.api.revokeUserSessions: it exists only with the admin()
+   * plugin and is gated on an authenticated admin session, which the
+   * self-service deleteUser flow does not have. Making deletion
+   * incomplete should require deliberately writing a no-op, not
+   * forgetting a field.
+   */
+  revokeSessions: (userId: string) => Promise<void>;
+  /**
    * Callback to write audit entry (optional).
    */
   writeAuditEntry?: (entry: LedgerAuditEntry) => Promise<void>;
@@ -288,13 +309,43 @@ export interface SoftDeleteCallbackOptions {
 /**
  * Creates a beforeDelete callback that performs soft-delete instead of hard delete.
  *
- * This callback:
- * 1. Performs a soft-delete UPDATE on the user record
- * 2. Logs an audit entry (if writeAuditEntry is provided)
- * 3. Throws to prevent the actual hard delete
+ * This callback, IN ORDER:
+ * 1. Revokes all of the user's sessions (revokeSessions -- required).
+ *    Revocation failure aborts the whole operation with the real error:
+ *    the caller must see the deletion as failed, never as succeeded
+ *    with live sessions left behind.
+ * 2. Performs the soft-delete UPDATE on the user record
+ * 3. Logs a redacted audit entry (if writeAuditEntry is provided)
+ * 4. Throws SoftDeletePerformedError to prevent the actual hard delete
  *
  * IMPORTANT: The throw prevents the hard delete from happening.
  * Your client code should catch this and treat it as success.
+ *
+ * SOFT-DELETE IS NOT DELETION UNTIL SIGN-IN IS GATED. Aborting
+ * better-auth's deleteUser also aborts its account/OAuth cleanup, and
+ * better-auth session resolution knows nothing about deletedAt -- so
+ * beyond session revocation you MUST gate authentication on deletedAt,
+ * or an OAuth sign-in on the soft-deleted row silently resurrects the
+ * account. Recipe: a user databaseHook (or session create hook) that
+ * rejects when the resolved user has deletedAt set:
+ *
+ * ```typescript
+ * import { APIError } from "better-auth/api";
+ *
+ * databaseHooks: {
+ *   session: {
+ *     create: {
+ *       before: async (session) => {
+ *         const [u] = await db.select().from(users)
+ *           .where(eq(users.id, session.userId));
+ *         if (u?.deletedAt) {
+ *           throw new APIError("FORBIDDEN", { message: "Account deleted" });
+ *         }
+ *       },
+ *     },
+ *   },
+ * },
+ * ```
  *
  * @param options - Configuration options
  * @returns A beforeDelete callback function
@@ -312,6 +363,16 @@ export interface SoftDeleteCallbackOptions {
  *         db,
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
+ *         revokeSessions: async (userId) => {
+ *           // The internal adapter works in the self-service deleteUser
+ *           // flow and clears secondaryStorage itself. Do NOT use
+ *           // auth.api.revokeUserSessions -- that endpoint exists only
+ *           // with the admin() plugin and requires an authenticated
+ *           // ADMIN session, which the user deleting their own account
+ *           // does not have.
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
+ *         },
  *         writeAuditEntry: async (entry) => {
  *           await db.insert(auditLog).values({ ...entry, id: uuidv7() });
  *         },
@@ -324,9 +385,17 @@ export interface SoftDeleteCallbackOptions {
 export function createSoftDeleteCallback(
   options: SoftDeleteCallbackOptions,
 ): (user: User, request?: Request) => Promise<void> {
-  const { db, userTable, whereUserId, writeAuditEntry } = options;
+  const { db, userTable, whereUserId, revokeSessions, writeAuditEntry } = options;
 
   return async (user: User, _request?: Request): Promise<void> => {
+    // Revoke sessions FIRST. If this throws, the real error propagates:
+    // no soft-delete happens, no success is signaled, and the caller
+    // sees the deletion as failed. A crash between revocation and the
+    // UPDATE leaves sessions dead and the user intact -- a safe state
+    // the user can retry from. The reverse order would leave a
+    // "deleted" user with live sessions.
+    await revokeSessions(user.id);
+
     // Perform soft-delete
     const deleteVals = softDeleteValues(null);
 

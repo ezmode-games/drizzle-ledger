@@ -94,13 +94,33 @@ Note: better-auth's `update.after` hook does not expose the previous row state, 
 
 ## `createSoftDeleteCallback`
 
-Creates a `beforeDelete` handler for `user.deleteUser`. When better-auth calls this handler before deleting a user, it:
+Creates a `beforeDelete` handler for `user.deleteUser`. When better-auth calls this handler before deleting a user, it, in order:
 
-1. Executes `UPDATE users SET deleted_at = ?, deleted_by = ? WHERE id = ?`
-2. Logs a `SOFT_DELETE` audit entry (if `writeAuditEntry` is provided)
-3. Throws `SoftDeletePerformedError` to abort the hard delete
+1. Revokes ALL of the user's sessions via the required `revokeSessions` callback. If revocation throws, the real error propagates -- no soft-delete happens and the deletion fails visibly.
+2. Executes `UPDATE users SET deleted_at = ?, deleted_by = ? WHERE id = ?`
+3. Logs a redacted `SOFT_DELETE` audit entry (if `writeAuditEntry` is provided)
+4. Throws `SoftDeletePerformedError` to abort the hard delete
 
 The throw is the mechanism. better-auth runs `beforeDelete`, sees the throw, and halts. The user row is never removed.
+
+**Soft-delete is not deletion until sessions die and sign-in is gated.** Aborting `deleteUser` also aborts better-auth's own cleanup: nothing else revokes sessions (including cookie caches and KV-backed `secondaryStorage`), account/OAuth rows survive, and better-auth session resolution knows nothing about `deletedAt`. `revokeSessions` closes the live-session half. The other half is yours: gate authentication on `deletedAt`, or an OAuth sign-in on the soft-deleted row silently resurrects the account:
+
+```typescript
+import { APIError } from "better-auth/api";
+
+databaseHooks: {
+  session: {
+    create: {
+      before: async (session) => {
+        const [u] = await db.select().from(users).where(eq(users.id, session.userId));
+        if (u?.deletedAt) {
+          throw new APIError("FORBIDDEN", { message: "Account deleted" });
+        }
+      },
+    },
+  },
+},
+```
 
 ```typescript
 import { eq } from "drizzle-orm";
@@ -111,6 +131,14 @@ const softDelete = createSoftDeleteCallback({
   db,
   userTable: users,
   whereUserId: (userId) => eq(users.id, userId),
+  revokeSessions: async (userId) => {
+    // The internal adapter works in the self-service deleteUser flow
+    // and clears secondaryStorage itself. auth.api.revokeUserSessions
+    // would NOT work here: it exists only with the admin() plugin and
+    // requires an authenticated admin session.
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.deleteSessions(userId);
+  },
   writeAuditEntry: async (entry) => {
     await db.insert(auditLog).values({
       id: uuidv7(),
@@ -147,7 +175,9 @@ export const auth = betterAuth({
 | `db` | Drizzle instance | Yes | Must expose `.update()`. The same instance you use elsewhere. |
 | `userTable` | Drizzle table | Yes | Must have `id` and `deletedAt` columns. If it also has `deletedBy`, that column is set automatically. |
 | `whereUserId` | `(userId: string) => SQL` | Yes | Returns the WHERE clause for the update. |
+| `revokeSessions` | `(userId: string) => Promise<void>` | Yes | Revokes all sessions for the user, runs FIRST. Failure aborts the deletion with the real error. |
 | `writeAuditEntry` | `(entry: LedgerAuditEntry) => Promise<void>` | No | Same callback shape as `ledgerPlugin`. Omit to skip audit logging on delete. |
+| `redactPatterns` | `readonly string[]` | No | Extra key patterns to redact in the audit entry. Redaction itself is always on. |
 
 The `deletedBy` column is optional on the table. If it exists, the callback sets it to `null` (the user deleted their own account; there is no acting admin ID available at this point in the better-auth flow). If you need a specific `deletedBy` value, write the callback manually using `softDeleteValues` from `@rafters/ledger`.
 

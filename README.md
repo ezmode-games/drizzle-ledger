@@ -24,6 +24,10 @@ Full documentation: [docs/](./docs/)
 | [Better Auth](./docs/better-auth.mdx) | `ledgerPlugin`, `createSoftDeleteCallback`, flow control |
 | [API Reference](./docs/api-reference.mdx) | Every export, every type, organized by subpath |
 
+## Soft-delete is not deletion until sessions die
+
+`createSoftDeleteCallback` intercepts better-auth's `deleteUser` by throwing, which also aborts better-auth's own cleanup: nothing else revokes sessions, account/OAuth rows survive, and better-auth session resolution knows nothing about `deletedAt`. The callback therefore REQUIRES a `revokeSessions` implementation and runs it before anything else -- and you must additionally gate authentication on `deletedAt`, or an OAuth sign-in on the soft-deleted row silently resurrects the account. The full contract and a sign-in gate recipe live in the [Better Auth guide](./docs/better-auth.mdx) and on the `createSoftDeleteCallback` docblock.
+
 ## License
 
 MIT. Authored by Sean Silvius. Source: [github.com/rafters-studio/ledger](https://github.com/rafters-studio/ledger).
