@@ -64,7 +64,7 @@ CREATE TABLE audit_log (
   id          TEXT PRIMARY KEY,
   table_name  TEXT NOT NULL,
   record_id   TEXT NOT NULL,
-  action      TEXT NOT NULL CHECK (action IN ('INSERT','UPDATE','DELETE','SOFT_DELETE','RESTORE')),
+  action      TEXT NOT NULL CHECK (action IN ('INSERT','UPDATE','DELETE','SOFT_DELETE','RESTORE','PURGE')),
   old_data    TEXT,
   new_data    TEXT,
   user_id     TEXT,
@@ -80,6 +80,25 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_user         ON audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created      ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_request      ON audit_log(request_id);
 ```
+
+### Append-only protection (recommended)
+
+`auditLogProtectSql(tableName?)` -- exported per dialect from `@rafters/ledger/drizzle/schema/{sqlite,pg,mysql}` -- returns statements that make the audit table append-only at the engine: UPDATE and DELETE fail loudly (SQLite `RAISE(ABORT)`, PostgreSQL a plpgsql trigger with `RAISE EXCEPTION`, MySQL `SIGNAL SQLSTATE '45000'`) no matter which code path attempts them. `AUDIT_LOG_PROTECT_SQL` is the pre-built default for the `audit_log` table name. Apply in a migration:
+
+```typescript
+import { auditLogProtectSql } from "@rafters/ledger/drizzle/schema/sqlite";
+
+// Same name you gave createAuditLogTable / createAuditedDb's
+// auditTableName -- protecting the default name while writing to a
+// custom table protects nothing.
+for (const statement of auditLogProtectSql("audit_log")) {
+  // add to your migration file
+}
+```
+
+Two caveats. First, `purgeUserData` legitimately UPDATEs audit rows: if you use the GDPR purge, apply only the delete-blocking statement, or drop and re-create the update trigger around purge runs. Second, trigger names derive from the table name -- if a same-named trigger already exists, SQLite's `IF NOT EXISTS` silently keeps the old one (verify it actually blocks writes) and PostgreSQL's `CREATE OR REPLACE` clobbers it.
+
+`createAuditedDb` refuses deletes on the audit table in code as well (`AuditTableDeleteError`, table name via its `auditTableName` config): the trail is not wipeable through ledger's own wrapper even before the engine-level protection is applied.
 
 ---
 
@@ -172,7 +191,11 @@ import { runWithLedgerContext, createLedgerContext } from "@rafters/ledger";
 app.use(async (c, next) => {
   const context = createLedgerContext({
     userId: c.get("user")?.id ?? null,
-    ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+    // IP NOTE: x-forwarded-for / x-real-ip are client-controlled and
+    // spoof the audit ip. Use your platform's trusted client-ip source
+    // (CF-Connecting-IP on Cloudflare, the leftmost VERIFIED hop
+    // behind your own proxy) -- never the raw header chain.
+    ip: c.req.header("cf-connecting-ip") ?? null,
     userAgent: c.req.header("user-agent") ?? null,
     endpoint: `${c.req.method} ${c.req.path}`,
     requestId: c.get("requestId"),

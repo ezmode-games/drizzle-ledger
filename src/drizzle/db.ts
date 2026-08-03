@@ -21,7 +21,11 @@
 
 import { createAuditEntry } from "../core/audit.js";
 import { getLedgerContext } from "../core/context.js";
-import { MissingSoftDeleteColumnError, UnresolvedSoftDeleteTableError } from "../core/errors.js";
+import {
+  AuditTableDeleteError,
+  MissingSoftDeleteColumnError,
+  UnresolvedSoftDeleteTableError,
+} from "../core/errors.js";
 import { softDeleteValues } from "../core/soft-delete.js";
 import type { AuditLogEntry } from "../core/types.js";
 
@@ -51,6 +55,15 @@ export interface AuditedDbConfig {
    * ordinary updates. Write failures are logged, never thrown.
    */
   writeAuditEntry?: (entry: AuditLogEntry) => Promise<void>;
+  /**
+   * Name of the audit log table (default: "audit_log"). Deletes on it
+   * through this wrapper THROW -- the trail must not be wipeable via
+   * ledger's own APIs. Pair with auditLogProtectSql(auditTableName)
+   * from the dialect schema module for engine-level append-only
+   * enforcement -- pass the SAME name to both, or the SQL protects a
+   * table you never write to.
+   */
+  auditTableName?: string;
 }
 
 /**
@@ -244,9 +257,16 @@ export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfi
   // fire audits for member statements that never flow through then().
   const statementAudits = new WeakMap<object, () => void>();
 
+  const auditTableName = config?.auditTableName ?? "audit_log";
+
   const interceptDelete = (table: unknown): unknown => {
     const target = db as unknown as DeleteAndUpdateCapable;
     const tableName = getTableName(table);
+
+    // The audit trail must not be wipeable through ledger's own wrapper.
+    if (tableName === auditTableName) {
+      throw new AuditTableDeleteError(auditTableName);
+    }
 
     if (tableName && config?.hardDeleteTables?.includes(tableName)) {
       return target.delete(table);

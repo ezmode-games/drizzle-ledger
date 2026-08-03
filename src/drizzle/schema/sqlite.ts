@@ -67,3 +67,29 @@ export const AUDIT_LOG_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)",
   "CREATE INDEX IF NOT EXISTS idx_audit_log_request ON audit_log(request_id)",
 ] as const;
+
+/**
+ * Build append-only protection SQL for a given audit table name:
+ * triggers that reject UPDATE and DELETE at the engine, so tampering
+ * fails no matter which code path attempts it. Apply in a migration.
+ *
+ * NOTES:
+ * - purgeUserData legitimately UPDATEs audit rows -- if you use the
+ *   GDPR purge, apply only the delete-blocking trigger, or drop and
+ *   re-create the update trigger around purge runs.
+ * - Pass the SAME table name you gave createAuditLogTable /
+ *   createAuditedDb's auditTableName; protecting the default name while
+ *   writing to a custom table protects nothing.
+ * - Trigger names derive from the table name. IF NOT EXISTS silently
+ *   keeps a pre-existing SAME-NAMED trigger -- if you already have one,
+ *   verify it actually blocks writes.
+ */
+export function auditLogProtectSql(tableName = "audit_log"): readonly [string, string] {
+  return [
+    `CREATE TRIGGER IF NOT EXISTS trg_${tableName}_no_update BEFORE UPDATE ON ${tableName} BEGIN SELECT RAISE(ABORT, '${tableName} is append-only'); END`,
+    `CREATE TRIGGER IF NOT EXISTS trg_${tableName}_no_delete BEFORE DELETE ON ${tableName} BEGIN SELECT RAISE(ABORT, '${tableName} is append-only'); END`,
+  ] as const;
+}
+
+/** Append-only protection for the default audit_log table. */
+export const AUDIT_LOG_PROTECT_SQL = auditLogProtectSql();

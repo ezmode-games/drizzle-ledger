@@ -21,6 +21,7 @@ export type { LedgerAdapter } from "./adapter.js";
 
 // Context
 export {
+  assertLedgerContextAvailable,
   createLedgerContext,
   createSystemContext,
   getLedgerContext,
@@ -53,7 +54,9 @@ export {
 
 // Errors
 export {
+  AuditTableDeleteError,
   isSoftDeletePerformed,
+  LedgerContextUnavailableError,
   MissingSoftDeleteColumnError,
   SoftDeletePerformedError,
   UnresolvedSoftDeleteTableError,

@@ -6,11 +6,15 @@
  *
  * @example
  * ```typescript
- * // In middleware
+ * // In middleware. IP NOTE: x-forwarded-for / x-real-ip are
+ * // client-controlled and spoof the audit ip -- use the platform's
+ * // trusted client-ip source (CF-Connecting-IP on Cloudflare, the
+ * // leftmost VERIFIED hop behind your own proxy), never the raw
+ * // header chain.
  * app.use(async (c, next) => {
  *   return runWithLedgerContext({
  *     userId: c.get('user')?.id ?? null,
- *     ip: c.req.header('x-forwarded-for') ?? c.req.header('x-real-ip') ?? null,
+ *     ip: c.req.header('cf-connecting-ip') ?? null,
  *     userAgent: c.req.header('user-agent') ?? null,
  *     endpoint: `${c.req.method} ${c.req.path}`,
  *     requestId: c.get('requestId'),
@@ -23,10 +27,18 @@
  * ```
  */
 
+import { LedgerContextUnavailableError } from "./errors.js";
 import type { LedgerContext } from "./types.js";
 
 // Use global AsyncLocalStorage (Cloudflare Workers compatible)
 // Do NOT import from 'node:async_hooks' - it doesn't exist in Workers runtime
+
+// Core-level safe logger: never throws, prefixes for grep-ability.
+// Mirrors the better-auth module's safeLog without a cross-layer import.
+function safeLog(message: string): void {
+  // eslint-disable-next-line no-console
+  console.error(`[ledger] ${message}`);
+}
 
 /**
  * Lazily initialized AsyncLocalStorage instance for ledger context.
@@ -36,6 +48,7 @@ import type { LedgerContext } from "./types.js";
  */
 let ledgerStorage: AsyncLocalStorage<LedgerContext> | null = null;
 let storageInitialized = false;
+let degradationWarned = false;
 
 function getStorage(): AsyncLocalStorage<LedgerContext> | null {
   if (!storageInitialized) {
@@ -45,7 +58,36 @@ function getStorage(): AsyncLocalStorage<LedgerContext> | null {
       ledgerStorage = new AsyncLocalStorage<LedgerContext>();
     }
   }
+  if (ledgerStorage === null && !degradationWarned) {
+    degradationWarned = true;
+    // Silent degradation of a security feature is worse than noise:
+    // without AsyncLocalStorage every audit entry gets userId null and
+    // every soft-delete gets deletedBy null, with nothing to say why.
+    safeLog(
+      "AsyncLocalStorage is not available in this runtime; ledger context is disabled -- audit entries will be unattributed (userId null). Call assertLedgerContextAvailable() at boot to fail fast instead.",
+    );
+  }
   return ledgerStorage;
+}
+
+/**
+ * Throw at boot if AsyncLocalStorage is unavailable, instead of
+ * shipping an unattributed audit trail. Without this check the context
+ * degrades with a single console warning: every entry's userId is null
+ * and every soft-delete's deletedBy is null.
+ *
+ * @throws LedgerContextUnavailableError when AsyncLocalStorage is missing
+ *
+ * @example
+ * ```typescript
+ * // Worker boot / app entry
+ * assertLedgerContextAvailable();
+ * ```
+ */
+export function assertLedgerContextAvailable(): void {
+  if (getStorage() === null) {
+    throw new LedgerContextUnavailableError();
+  }
 }
 
 /**
@@ -125,7 +167,7 @@ export function hasLedgerContext(): boolean {
  * ```typescript
  * const context = createLedgerContext({
  *   userId: session?.user?.id,
- *   ip: req.headers['x-forwarded-for'],
+ *   ip: req.headers['cf-connecting-ip'], // trusted source, not x-forwarded-for
  *   userAgent: req.headers['user-agent'],
  *   endpoint: `${req.method} ${req.url}`,
  * });
