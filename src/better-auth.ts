@@ -23,7 +23,8 @@
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
- *           await auth.api.revokeUserSessions({ body: { userId } });
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
  *         },
  *       }),
  *     },
@@ -357,10 +358,14 @@ export interface SoftDeleteCallbackOptions {
    * cleanup, so nothing else revokes sessions: without this, a
    * "deleted" user keeps every live session (cookie cache, KV-backed
    * secondaryStorage, session rows) until natural expiry. Wire it to
-   * better-auth's session revocation (e.g.
-   * auth.api.revokeUserSessions / the internal adapter) AND any
-   * secondaryStorage the app uses. Making deletion incomplete should
-   * require deliberately writing a no-op, not forgetting a field.
+   * better-auth's INTERNAL adapter --
+   * (await auth.$context).internalAdapter.deleteSessions(userId) --
+   * which also clears secondaryStorage. Do not use
+   * auth.api.revokeUserSessions: it exists only with the admin()
+   * plugin and is gated on an authenticated admin session, which the
+   * self-service deleteUser flow does not have. Making deletion
+   * incomplete should require deliberately writing a no-op, not
+   * forgetting a field.
    */
   revokeSessions: (userId: string) => Promise<void>;
   /**
@@ -398,6 +403,8 @@ export interface SoftDeleteCallbackOptions {
  * rejects when the resolved user has deletedAt set:
  *
  * ```typescript
+ * import { APIError } from "better-auth/api";
+ *
  * databaseHooks: {
  *   session: {
  *     create: {
@@ -430,7 +437,14 @@ export interface SoftDeleteCallbackOptions {
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
- *           await auth.api.revokeUserSessions({ body: { userId } });
+ *           // The internal adapter works in the self-service deleteUser
+ *           // flow and clears secondaryStorage itself. Do NOT use
+ *           // auth.api.revokeUserSessions -- that endpoint exists only
+ *           // with the admin() plugin and requires an authenticated
+ *           // ADMIN session, which the user deleting their own account
+ *           // does not have.
+ *           const ctx = await auth.$context;
+ *           await ctx.internalAdapter.deleteSessions(userId);
  *         },
  *         writeAuditEntry: async (entry) => {
  *           await db.insert(auditLog).values({ ...entry, id: uuidv7() });
@@ -468,22 +482,28 @@ export function createSoftDeleteCallback(
 
     // Log to audit (redacted, fail-closed on redaction failure)
     if (writeAuditEntry) {
+      let redacted: LedgerAuditEntry | null = null;
       try {
-        await writeAuditEntry(
-          redactAuditEntry(
-            {
-              tableName: "user",
-              recordId: user.id,
-              action: "SOFT_DELETE",
-              oldData: user as unknown as Record<string, unknown>,
-              newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
-              userId: user.id,
-            },
-            options.redactPatterns,
-          ),
+        redacted = redactAuditEntry(
+          {
+            tableName: "user",
+            recordId: user.id,
+            action: "SOFT_DELETE",
+            oldData: user as unknown as Record<string, unknown>,
+            newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
+            userId: user.id,
+          },
+          options.redactPatterns,
         );
       } catch (error) {
-        safeLog("Failed to write audit entry for soft-delete", error);
+        safeLog("Redaction failed; soft-delete audit entry NOT written", error);
+      }
+      if (redacted) {
+        try {
+          await writeAuditEntry(redacted);
+        } catch (error) {
+          safeLog("Failed to write audit entry for soft-delete", error);
+        }
       }
     }
 
@@ -524,22 +544,28 @@ export function createDeleteAuditCallback(
   redactPatterns?: readonly string[],
 ): (user: User, request?: Request) => Promise<void> {
   return async (user: User, _request?: Request): Promise<void> => {
+    let redacted: LedgerAuditEntry | null = null;
     try {
-      await writeAuditEntry(
-        redactAuditEntry(
-          {
-            tableName: "user",
-            recordId: user.id,
-            action: "DELETE", // Hard delete action (user was permanently deleted)
-            oldData: user as unknown as Record<string, unknown>,
-            newData: null,
-            userId: user.id,
-          },
-          redactPatterns,
-        ),
+      redacted = redactAuditEntry(
+        {
+          tableName: "user",
+          recordId: user.id,
+          action: "DELETE", // Hard delete action (user was permanently deleted)
+          oldData: user as unknown as Record<string, unknown>,
+          newData: null,
+          userId: user.id,
+        },
+        redactPatterns,
       );
     } catch (error) {
-      safeLog("Failed to write audit entry for delete", error);
+      safeLog("Redaction failed; delete audit entry NOT written", error);
+    }
+    if (redacted) {
+      try {
+        await writeAuditEntry(redacted);
+      } catch (error) {
+        safeLog("Failed to write audit entry for delete", error);
+      }
     }
   };
 }

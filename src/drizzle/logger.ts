@@ -3,6 +3,12 @@
  *
  * A Drizzle Logger implementation that captures query information
  * for audit logging purposes.
+ *
+ * This is a best-effort observability trail, not a completeness-guaranteed
+ * audit mechanism: it sees queries as SQL text and reconstructs intent by
+ * parsing. Mutations it cannot parse are surfaced as entries with
+ * tableName "unknown" rather than silently skipped -- the visible gap is
+ * what keeps the trail honest.
  */
 
 import type { Logger } from "drizzle-orm";
@@ -24,6 +30,12 @@ export interface AuditEntryInput {
   recordId: string | null;
   action: "INSERT" | "UPDATE" | "DELETE" | "SELECT";
   query: string;
+  /**
+   * Bound query parameters. Populated only when `includeParams` is set:
+   * params carry EVERY bound value -- password hashes, tokens, message
+   * bodies -- so persisting them turns the audit trail into a secrets
+   * store. Empty array when params are excluded (the default).
+   */
   params: unknown[];
   userId: string | null;
   ip: string | null;
@@ -36,12 +48,38 @@ export interface AuditEntryInput {
  * Configuration for AuditLogger.
  */
 export interface AuditLoggerConfig {
-  /** Tables to audit (if empty, audits all tables) */
+  /** Tables to audit (if empty, audits all tables). Case-insensitive. */
   includeTables?: string[];
-  /** Tables to exclude from auditing */
+  /** Tables to exclude from auditing. Case-insensitive. */
   excludeTables?: string[];
   /** Whether to log SELECT queries (default: false) */
   logSelects?: boolean;
+  /**
+   * Hold the audit write promise open past the response.
+   * Wire this to ExecutionContext.waitUntil in Cloudflare Workers --
+   * REQUIRED there: without it the runtime can cancel the unawaited
+   * write when the response returns and entries are silently dropped.
+   * Outside Workers, writes are tracked internally and can be drained
+   * with flush().
+   */
+  waitUntil?: (promise: Promise<unknown>) => void;
+  /**
+   * Include raw bound params in audit entries (default: false).
+   * Params contain every bound value including secrets -- opt in only
+   * when the audit sink is trusted with that material.
+   */
+  includeParams?: boolean;
+  /**
+   * Called when a mutation-shaped query could not be parsed.
+   * Default behavior (with or without this hook) writes an entry with
+   * tableName "unknown" so the gap is visible in the trail.
+   */
+  onUnparsedMutation?: (query: string) => void;
+  /**
+   * Called when writing an audit entry fails. Defaults to console.error.
+   * Write failures never break the query itself.
+   */
+  onWriteError?: (error: unknown, entry: AuditEntryInput) => void;
 }
 
 /**
@@ -51,49 +89,97 @@ export interface AuditLoggerConfig {
  * @returns Parsed query info or null if unparseable
  */
 export function parseQuery(query: string): ParsedQuery | null {
-  const normalized = query.trim().toUpperCase();
+  const normalized = query.trim();
 
-  // INSERT INTO table_name
-  const insertMatch = normalized.match(/^INSERT\s+INTO\s+[`"']?(\w+)[`"']?/i);
+  // Table reference: optionally schema-qualified (main.users, "s"."t").
+  // The LAST identifier is the table; attributing to the schema segment
+  // would be a confidently wrong table name.
+  const insertMatch = normalized.match(
+    /^INSERT\s+INTO\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (insertMatch?.[1]) {
-    return { action: "INSERT", table: insertMatch[1].toLowerCase() };
+    return { action: "INSERT", table: (insertMatch[2] ?? insertMatch[1]).toLowerCase() };
   }
 
-  // UPDATE table_name
-  const updateMatch = normalized.match(/^UPDATE\s+[`"']?(\w+)[`"']?/i);
+  const updateMatch = normalized.match(
+    /^UPDATE\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (updateMatch?.[1]) {
-    return { action: "UPDATE", table: updateMatch[1].toLowerCase() };
+    return { action: "UPDATE", table: (updateMatch[2] ?? updateMatch[1]).toLowerCase() };
   }
 
-  // DELETE FROM table_name
-  const deleteMatch = normalized.match(/^DELETE\s+FROM\s+[`"']?(\w+)[`"']?/i);
+  const deleteMatch = normalized.match(
+    /^DELETE\s+FROM\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (deleteMatch?.[1]) {
-    return { action: "DELETE", table: deleteMatch[1].toLowerCase() };
+    return { action: "DELETE", table: (deleteMatch[2] ?? deleteMatch[1]).toLowerCase() };
   }
 
-  // SELECT ... FROM table_name
-  const selectMatch = normalized.match(/^SELECT\s+.+?\s+FROM\s+[`"']?(\w+)[`"']?/i);
+  const selectMatch = normalized.match(
+    /^SELECT\s+.+?\s+FROM\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/is,
+  );
   if (selectMatch?.[1]) {
-    return { action: "SELECT", table: selectMatch[1].toLowerCase() };
+    return { action: "SELECT", table: (selectMatch[2] ?? selectMatch[1]).toLowerCase() };
   }
 
   return null;
 }
 
 /**
+ * Detect a query that mutates data even though parseQuery could not
+ * resolve its target table: CTE-led statements (WITH ... DELETE),
+ * INSERT OR REPLACE / REPLACE INTO, and other shapes outside the simple
+ * parser. Best-effort classification of the action for the "unknown"
+ * entry. Returns null for mutation-shaped leads with no mutation verb
+ * (a read-only CTE) -- fabricating a phantom mutation would be worse
+ * than the silent skip this function exists to prevent.
+ */
+export function classifyUnparsedMutation(query: string): "INSERT" | "UPDATE" | "DELETE" | null {
+  const normalized = query.trim().toUpperCase();
+
+  const isMutationShaped =
+    normalized.startsWith("WITH") ||
+    normalized.startsWith("INSERT") ||
+    normalized.startsWith("REPLACE") ||
+    normalized.startsWith("UPDATE") ||
+    normalized.startsWith("DELETE") ||
+    normalized.startsWith("MERGE");
+
+  if (!isMutationShaped) {
+    return null;
+  }
+
+  if (/\bDELETE\b/.test(normalized)) {
+    return "DELETE";
+  }
+  if (/\bINSERT\b|\bREPLACE\b|\bMERGE\b/.test(normalized)) {
+    return "INSERT";
+  }
+  if (/\bUPDATE\b/.test(normalized)) {
+    return "UPDATE";
+  }
+  // Mutation-shaped lead but no mutation verb anywhere: a read-only CTE
+  // (WITH t AS (SELECT ...) SELECT ...). Writing an "unknown" mutation
+  // entry here would fabricate a phantom mutation -- return null.
+  return null;
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
  * Try to extract a record ID from query params.
- * This is a best-effort extraction - not all queries will have identifiable record IDs.
+ * Only returns a param that is unambiguously id-shaped (a UUID) --
+ * looser matching misattributed entries to whatever plausible-looking
+ * string happened to bind first. Best-effort: null means "not confident",
+ * and consumers must treat recordId as advisory.
  *
  * @param params - Query parameters
- * @returns The first string parameter that looks like an ID, or null
+ * @returns The first UUID-shaped string parameter, or null
  */
 export function extractRecordId(params: unknown[]): string | null {
   for (const param of params) {
-    if (typeof param === "string" && param.length > 0 && param.length < 100) {
-      // Looks like a UUID or ID
-      if (/^[a-f0-9-]{20,}$/i.test(param) || /^[a-z0-9_-]+$/i.test(param)) {
-        return param;
-      }
+    if (typeof param === "string" && UUID_PATTERN.test(param)) {
+      return param;
     }
   }
   return null;
@@ -112,21 +198,50 @@ export function extractRecordId(params: unknown[]): string | null {
  *       createdAt: new Date(),
  *     });
  *   },
- *   { excludeTables: ['audit_log', 'session'] }
+ *   {
+ *     excludeTables: ['audit_log', 'session'],
+ *     waitUntil: (p) => ctx.waitUntil(p),
+ *   }
  * );
  *
  * const db = drizzle(d1, { logger });
  * ```
  */
 export class AuditLogger implements Logger {
+  private pending = new Set<Promise<void>>();
+  private lowerInclude: string[] | undefined;
+  private lowerExclude: string[] | undefined;
+
   constructor(
     private writeAuditEntry: (entry: AuditEntryInput) => Promise<void>,
     private config?: AuditLoggerConfig,
-  ) {}
+  ) {
+    this.lowerInclude = config?.includeTables?.map((t) => t.toLowerCase());
+    this.lowerExclude = config?.excludeTables?.map((t) => t.toLowerCase());
+  }
 
   logQuery(query: string, params: unknown[]): void {
     const parsed = parseQuery(query);
+
     if (!parsed) {
+      // A mutation we could not parse must not vanish from the trail.
+      const action = classifyUnparsedMutation(query);
+      if (action) {
+        try {
+          this.config?.onUnparsedMutation?.(query);
+        } catch (err) {
+          // A throwing hook must never break the query path.
+          console.error("[ledger] onUnparsedMutation hook threw:", err);
+        }
+        this.write({
+          tableName: "unknown",
+          recordId: null,
+          action,
+          query,
+          params: this.config?.includeParams ? params : [],
+          ...this.contextFields(),
+        });
+      }
       return;
     }
 
@@ -135,35 +250,77 @@ export class AuditLogger implements Logger {
       return;
     }
 
-    // Check include/exclude tables
-    if (this.config?.includeTables?.length) {
-      if (!this.config.includeTables.includes(parsed.table)) {
-        return;
-      }
-    }
-
-    if (this.config?.excludeTables?.includes(parsed.table)) {
+    // Check include/exclude tables (case-insensitive)
+    if (this.lowerInclude?.length && !this.lowerInclude.includes(parsed.table)) {
       return;
     }
 
-    // Get context from AsyncLocalStorage
-    const context = getLedgerContext();
+    if (this.lowerExclude?.includes(parsed.table)) {
+      return;
+    }
 
-    // Fire and forget - don't await, don't block the query
-    this.writeAuditEntry({
+    this.write({
       tableName: parsed.table,
       recordId: extractRecordId(params),
       action: parsed.action,
       query,
-      params,
+      params: this.config?.includeParams ? params : [],
+      ...this.contextFields(),
+    });
+  }
+
+  /**
+   * Wait for all in-flight audit writes to settle.
+   * Use at shutdown (or per-request outside Workers) to guarantee no
+   * entry is lost to an exiting process. With `waitUntil` configured the
+   * platform holds the writes instead and flush resolves immediately.
+   */
+  async flush(): Promise<void> {
+    await Promise.allSettled(this.pending);
+  }
+
+  private contextFields(): Pick<
+    AuditEntryInput,
+    "userId" | "ip" | "userAgent" | "endpoint" | "requestId"
+  > {
+    const context = getLedgerContext();
+    return {
       userId: context?.userId ?? null,
       ip: context?.ip ?? null,
       userAgent: context?.userAgent ?? null,
       endpoint: context?.endpoint ?? null,
       requestId: context?.requestId,
-    }).catch((err) => {
-      // Log error but don't throw - audit failures shouldn't break the app
-      console.error("[ledger] Failed to write audit entry:", err);
+    };
+  }
+
+  private write(entry: AuditEntryInput): void {
+    // Promise.resolve().then(...) normalizes a synchronously-throwing
+    // sink into a rejection the .catch below handles -- a sync throw
+    // must never propagate into Drizzle's query path.
+    const promise = Promise.resolve()
+      .then(() => this.writeAuditEntry(entry))
+      .catch((err) => {
+        const onWriteError = this.config?.onWriteError;
+        if (onWriteError) {
+          try {
+            onWriteError(err, entry);
+          } catch (hookErr) {
+            console.error("[ledger] onWriteError hook threw:", hookErr);
+          }
+        } else {
+          console.error("[ledger] Failed to write audit entry:", err);
+        }
+      });
+
+    if (this.config?.waitUntil) {
+      this.config.waitUntil(promise);
+      return;
+    }
+
+    // Track locally so flush() can drain before process exit.
+    this.pending.add(promise);
+    promise.finally(() => {
+      this.pending.delete(promise);
     });
   }
 }

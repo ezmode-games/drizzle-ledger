@@ -12,7 +12,7 @@ import type { AuditLogEntry, LedgerContext } from "./types.js";
 /**
  * Action types for audit logging.
  */
-export type AuditAction = "INSERT" | "UPDATE" | "DELETE" | "SOFT_DELETE" | "RESTORE";
+export type AuditAction = "INSERT" | "UPDATE" | "DELETE" | "SOFT_DELETE" | "RESTORE" | "PURGE";
 
 /**
  * Options for creating an audit entry.

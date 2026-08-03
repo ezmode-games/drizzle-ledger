@@ -187,9 +187,10 @@ describe("ledgerPlugin", () => {
     expect(entryA?.userId).toBe("actor-a");
   });
 
-  test("an abandoned before-capture dies with its context -- no cross-request desync", async () => {
+  test("databaseHooks for account calls writeAuditEntry when opted in", async () => {
     const entries: LedgerAuditEntry[] = [];
     const plugin = ledgerPlugin({
+      auditTables: ["user", "account"],
       writeAuditEntry: (entry) => {
         entries.push(entry);
         return Promise.resolve();
@@ -759,6 +760,61 @@ describe("createDeleteAuditCallback", () => {
       action: "DELETE", // Hard delete action
       newData: null,
     });
+  });
+
+  test("redacts secret fields in the delete audit entry", async () => {
+    const entries: LedgerAuditEntry[] = [];
+    const callback = createDeleteAuditCallback((entry) => {
+      entries.push(entry);
+      return Promise.resolve();
+    });
+
+    const user = {
+      id: "user-1",
+      email: "x@test.com",
+      name: "X",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      emailVerified: false,
+      image: null,
+      twoFactorSecret: "otp-secret-value",
+    };
+
+    await expect(
+      callback(user as unknown as Parameters<typeof callback>[0]),
+    ).resolves.toBeUndefined();
+
+    expect(entries).toHaveLength(1);
+    expect(JSON.stringify(entries[0])).not.toContain("otp-secret-value");
+  });
+
+  test("fail-closed: unredactable entry is never written", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const writeSpy = vi.fn().mockResolvedValue(undefined);
+    const callback = createDeleteAuditCallback(writeSpy);
+
+    const poisoned: Record<string, unknown> = {
+      id: "user-1",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    Object.defineProperty(poisoned, "boobyTrap", {
+      enumerable: true,
+      get() {
+        throw new Error("cannot read");
+      },
+    });
+
+    await expect(
+      callback(poisoned as unknown as Parameters<typeof callback>[0]),
+    ).resolves.toBeUndefined();
+
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Redaction failed"),
+      expect.any(Error),
+    );
+    consoleSpy.mockRestore();
   });
 
   test("handles errors gracefully", async () => {

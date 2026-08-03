@@ -16,7 +16,7 @@ export const auditLog = pgTable("audit_log", {
   tableName: text("table_name").notNull(),
   recordId: text("record_id").notNull(),
   action: text("action", {
-    enum: ["INSERT", "UPDATE", "DELETE", "SOFT_DELETE", "RESTORE"],
+    enum: ["INSERT", "UPDATE", "DELETE", "SOFT_DELETE", "RESTORE", "PURGE"],
   }).notNull(),
   oldData: text("old_data"),
   newData: text("new_data"),
@@ -34,7 +34,7 @@ export function createAuditLogTable(tableName: string) {
     tableName: text("table_name").notNull(),
     recordId: text("record_id").notNull(),
     action: text("action", {
-      enum: ["INSERT", "UPDATE", "DELETE", "SOFT_DELETE", "RESTORE"],
+      enum: ["INSERT", "UPDATE", "DELETE", "SOFT_DELETE", "RESTORE", "PURGE"],
     }).notNull(),
     oldData: text("old_data"),
     newData: text("new_data"),
