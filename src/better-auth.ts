@@ -23,8 +23,23 @@
  *         userTable: users,
  *         whereUserId: (userId) => eq(users.id, userId),
  *         revokeSessions: async (userId) => {
+ *           // Feature-detect: better-auth split the internal session
+ *           // API mid-1.6 (deleteUserSessions(userId) vs the pre-split
+ *           // deleteSessions(userId)); on post-split versions a userId
+ *           // passed to deleteSessions SILENTLY DELETES NOTHING. The
+ *           // local type widening exists because the two better-auth
+ *           // type generations disagree -- it keeps both branches
+ *           // compiling on either version.
  *           const ctx = await auth.$context;
- *           await ctx.internalAdapter.deleteSessions(userId);
+ *           const ia = ctx.internalAdapter as {
+ *             deleteUserSessions?: (userId: string) => Promise<void>;
+ *             deleteSessions: (value: string | string[]) => Promise<void>;
+ *           };
+ *           if (ia.deleteUserSessions) {
+ *             await ia.deleteUserSessions(userId);
+ *           } else {
+ *             await ia.deleteSessions(userId);
+ *           }
  *         },
  *       }),
  *     },
@@ -359,8 +374,13 @@ export interface SoftDeleteCallbackOptions {
    * "deleted" user keeps every live session (cookie cache, KV-backed
    * secondaryStorage, session rows) until natural expiry. Wire it to
    * better-auth's INTERNAL adapter --
-   * (await auth.$context).internalAdapter.deleteSessions(userId) --
-   * which also clears secondaryStorage. Do not use
+   * (await auth.$context).internalAdapter.deleteUserSessions(userId)
+   * on current 1.6.x -- which also clears secondaryStorage (including
+   * the active-sessions index). Version hazard: before better-auth
+   * split the API mid-1.6, the call was deleteSessions(userId); on
+   * post-split versions deleteSessions takes session-token ARRAYS and
+   * a userId argument silently deletes nothing -- feature-detect
+   * deleteUserSessions (see the example below). Do not use
    * auth.api.revokeUserSessions: it exists only with the admin()
    * plugin and is gated on an authenticated admin session, which the
    * self-service deleteUser flow does not have. Making deletion
@@ -443,8 +463,23 @@ export interface SoftDeleteCallbackOptions {
  *           // with the admin() plugin and requires an authenticated
  *           // ADMIN session, which the user deleting their own account
  *           // does not have.
+ *           // VERSION NOTE: better-auth split the internal API mid-1.6.
+ *           // Late 1.6.x has deleteUserSessions(userId); before the
+ *           // split, deleteSessions accepted a userId directly -- and on
+ *           // post-split versions deleteSessions(userId) SILENTLY
+ *           // DELETES NOTHING (it now takes session-token arrays). The
+ *           // local type widening keeps both branches compiling on
+ *           // either version's shipped types.
  *           const ctx = await auth.$context;
- *           await ctx.internalAdapter.deleteSessions(userId);
+ *           const ia = ctx.internalAdapter as {
+ *             deleteUserSessions?: (userId: string) => Promise<void>;
+ *             deleteSessions: (value: string | string[]) => Promise<void>;
+ *           };
+ *           if (ia.deleteUserSessions) {
+ *             await ia.deleteUserSessions(userId);
+ *           } else {
+ *             await ia.deleteSessions(userId);
+ *           }
  *         },
  *         writeAuditEntry: async (entry) => {
  *           await db.insert(auditLog).values({ ...entry, id: uuidv7() });
