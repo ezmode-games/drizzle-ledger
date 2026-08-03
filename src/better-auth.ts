@@ -42,6 +42,8 @@
  */
 
 import type { BetterAuthPlugin, User } from "better-auth";
+import { getLedgerContext } from "./core/context.js";
+import type { LedgerContext } from "./core/types.js";
 import { softDeleteValues } from "./core/soft-delete.js";
 import { SoftDeletePerformedError, isSoftDeletePerformed } from "./core/errors.js";
 import { redactSensitiveFields } from "./core/redact.js";
@@ -132,6 +134,23 @@ type UserWithId = { id: string } & Record<string, unknown>;
  * - Audit logging for user and account create/update operations via databaseHooks
  * - Optional delete audit logging when softDeleteTables includes 'user'
  *
+ * ATTRIBUTION REQUIRES CONTEXT: entries attribute to the authenticated
+ * principal from AsyncLocalStorage. Wrap request handling in
+ * runWithLedgerContext or every actor is null (except self-signup):
+ *
+ * ```typescript
+ * // Hono middleware, before the auth handler
+ * app.use(async (c, next) => {
+ *   return runWithLedgerContext(
+ *     createLedgerContext({
+ *       userId: c.get("user")?.id ?? null,
+ *       endpoint: `${c.req.method} ${c.req.path}`,
+ *     }),
+ *     next,
+ *   );
+ * });
+ * ```
+ *
  * NOTE: This plugin only provides audit logging. For actual soft-delete behavior
  * (updating deletedAt instead of hard deleting), use createSoftDeleteCallback
  * with the user.deleteUser.beforeDelete option.
@@ -182,9 +201,39 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
     }
   }
 
+  /**
+   * Resolve the acting principal for an audit entry.
+   * The authenticated actor from ledger context (runWithLedgerContext
+   * middleware) always wins; without context the actor is unknown --
+   * NEVER default to the target row's id, which recorded an admin
+   * banning a user as the user acting on themselves. The one exception
+   * is user self-creation (signup), where the created user genuinely is
+   * the actor and no context exists yet.
+   */
+  function resolveActor(fallback: string | null = null): string | null {
+    return getLedgerContext()?.userId ?? fallback;
+  }
+
   // Build databaseHooks based on audited tables
   // biome-ignore lint/suspicious/noExplicitAny: Required for better-auth databaseHooks typing
   const databaseHooks: Record<string, any> = {};
+
+  // Pair update.before change sets with update.after results, keyed by
+  // the request's LedgerContext object (per-table queue per context).
+  // better-auth's after hook has no access to the previous row and the
+  // before hook has no row id, so exact pairing is impossible from the
+  // hook surface. Keying by context confines pairing to one request:
+  // concurrent requests in the same isolate can never cross-pair, and
+  // an abandoned capture (a failed or vetoed update) dies with its
+  // context instead of desyncing the plugin forever. Within one
+  // request the queue is FIFO -- multiple updates to the same table in
+  // a single request pair in order, and a veto mid-request can still
+  // offset later pairs in THAT request; the { changed } entry shape
+  // keeps the provenance explicit rather than pretending to be a full
+  // before-image. Without a ledger context no capture happens and
+  // oldData stays null -- change-set capture, like attribution,
+  // requires runWithLedgerContext.
+  const pendingChangeSets = new WeakMap<LedgerContext, Record<string, Record<string, unknown>[]>>();
 
   for (const table of auditTables) {
     databaseHooks[table] = {
@@ -196,19 +245,41 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
             action: "INSERT",
             oldData: null,
             newData: data as Record<string, unknown>,
-            userId: table === "user" ? data.id : null,
+            // Self-signup: the created user is the actor when no
+            // authenticated context exists (there is no session yet).
+            userId: resolveActor(table === "user" ? data.id : null),
           });
         },
       },
       update: {
+        before: async (data: Record<string, unknown>) => {
+          const context = getLedgerContext();
+          if (context) {
+            const byTable = pendingChangeSets.get(context) ?? {};
+            (byTable[table] ??= []).push({ ...data });
+            pendingChangeSets.set(context, byTable);
+          }
+          // Return nothing: echoing { data } back would overwrite
+          // mutations other before-hooks made -- better-auth merges
+          // each hook's returned data onto the accumulator, and this
+          // hook receives the ORIGINAL payload, not the accumulated
+          // one. undefined skips the merge entirely.
+        },
         after: async (data: UserWithId) => {
+          const context = getLedgerContext();
+          const changed = context
+            ? (pendingChangeSets.get(context)?.[table]?.shift() ?? null)
+            : null;
           await audit({
             tableName: table,
             recordId: data.id,
             action: "UPDATE",
-            oldData: null, // We don't have access to old data in after hook
+            // Not a full before-image (better-auth does not expose the
+            // previous row); { changed } is the incoming change set
+            // captured by update.before within this request's context.
+            oldData: changed ? { changed } : null,
             newData: data as Record<string, unknown>,
-            userId: table === "user" ? data.id : null,
+            userId: resolveActor(),
           });
         },
       },
@@ -225,14 +296,16 @@ export function ledgerPlugin(config?: LedgerPluginConfig): BetterAuthPlugin {
   const userDeleteHooks = softDeleteTables.includes("user")
     ? {
         beforeDelete: async (user: User) => {
-          // Log the soft-delete intent
+          // Log the soft-delete intent. Self-service deletion is the
+          // common flow, so the target is the fallback actor; an
+          // authenticated context (admin deleting a user) wins.
           await audit({
             tableName: "user",
             recordId: user.id,
             action: "SOFT_DELETE",
             oldData: user as unknown as Record<string, unknown>,
             newData: null,
-            userId: user.id,
+            userId: resolveActor(user.id),
           });
         },
       }
