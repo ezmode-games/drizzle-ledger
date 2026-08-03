@@ -21,7 +21,7 @@
 
 import { createAuditEntry } from "../core/audit.js";
 import { getLedgerContext } from "../core/context.js";
-import { MissingSoftDeleteColumnError } from "../core/errors.js";
+import { MissingSoftDeleteColumnError, UnresolvedSoftDeleteTableError } from "../core/errors.js";
 import { softDeleteValues } from "../core/soft-delete.js";
 import type { AuditLogEntry } from "../core/types.js";
 
@@ -120,8 +120,27 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
  * (.where(), .returning()) -- fires onExecuted exactly once. Chain
  * methods return wrapped builders so the observation survives chaining.
  */
-function observeExecution<T extends object>(builder: T, onExecuted: () => void): T {
-  return new Proxy(builder, {
+function observeExecution<T extends object>(
+  builder: T,
+  onExecuted: () => void,
+  register?: (proxy: object) => void,
+): T {
+  const observedThen = (
+    target: object,
+    thenFn: (f?: (r: unknown) => unknown, r?: (e: unknown) => unknown) => unknown,
+    onFulfilled?: (result: unknown) => unknown,
+    onRejected?: (error: unknown) => unknown,
+  ) =>
+    thenFn.call(
+      target,
+      (result: unknown) => {
+        onExecuted();
+        return onFulfilled ? onFulfilled(result) : result;
+      },
+      onRejected,
+    );
+
+  const proxy = new Proxy(builder, {
     get(target, prop, receiver) {
       const value = Reflect.get(target, prop, receiver);
 
@@ -130,14 +149,31 @@ function observeExecution<T extends object>(builder: T, onExecuted: () => void):
           onFulfilled?: (result: unknown) => unknown,
           onRejected?: (error: unknown) => unknown,
         ) =>
-          (value as (f?: (r: unknown) => unknown, r?: (e: unknown) => unknown) => unknown).call(
+          observedThen(
             target,
-            (result: unknown) => {
-              onExecuted();
-              return onFulfilled ? onFulfilled(result) : result;
-            },
+            value as (f?: (r: unknown) => unknown, r?: (e: unknown) => unknown) => unknown,
+            onFulfilled,
             onRejected,
           );
+      }
+
+      // catch must route through the OBSERVED then, not the generic
+      // branch: Drizzle's QueryPromise implements catch as
+      // this.then(undefined, onRejected), and the generic branch would
+      // re-observe the promise catch returns -- which FULFILLS when the
+      // handler swallows a rejection, firing a false SOFT_DELETE audit
+      // entry for a statement that never executed.
+      if (prop === "catch" && typeof value === "function") {
+        const thenFn = Reflect.get(target, "then", receiver);
+        if (typeof thenFn === "function") {
+          return (onRejected?: (error: unknown) => unknown) =>
+            observedThen(
+              target,
+              thenFn as (f?: (r: unknown) => unknown, r?: (e: unknown) => unknown) => unknown,
+              undefined,
+              onRejected,
+            );
+        }
       }
 
       if (typeof value !== "function") {
@@ -151,7 +187,7 @@ function observeExecution<T extends object>(builder: T, onExecuted: () => void):
           // Thenable builders (where/returning chains) stay observable;
           // plain promises (execute/run) observe on fulfillment.
           if (typeof result === "object" && result !== null && !(result instanceof Promise)) {
-            return observeExecution(result as object, onExecuted);
+            return observeExecution(result as object, onExecuted, register);
           }
           return (result as Promise<unknown>).then((r) => {
             onExecuted();
@@ -160,13 +196,15 @@ function observeExecution<T extends object>(builder: T, onExecuted: () => void):
         }
 
         if (result !== null && typeof result === "object") {
-          return observeExecution(result as object, onExecuted);
+          return observeExecution(result as object, onExecuted, register);
         }
 
         return result;
       };
     },
   }) as T;
+  register?.(proxy as object);
+  return proxy;
 }
 
 /**
@@ -201,6 +239,10 @@ function observeExecution<T extends object>(builder: T, onExecuted: () => void):
  */
 export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfig): T {
   const softDeleteFactory = config?.softDeleteValuesFactory ?? softDeleteValues;
+  // Statement proxies (and every proxy derived from them by chaining)
+  // mapped to their once-guarded audit trigger, so the batch path can
+  // fire audits for member statements that never flow through then().
+  const statementAudits = new WeakMap<object, () => void>();
 
   const interceptDelete = (table: unknown): unknown => {
     const target = db as unknown as DeleteAndUpdateCapable;
@@ -211,8 +253,14 @@ export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfi
     }
 
     if (config?.softDeleteTables) {
-      // Allowlist mode: listed tables MUST be soft-deletable.
-      if (!tableName || !config.softDeleteTables.includes(tableName)) {
+      // Allowlist mode: loud by contract. An unresolvable table name
+      // cannot be checked against the allowlist, so it throws instead
+      // of silently hard-deleting in the mode that exists to prevent
+      // exactly that.
+      if (!tableName) {
+        throw new UnresolvedSoftDeleteTableError();
+      }
+      if (!config.softDeleteTables.includes(tableName)) {
         return target.delete(table);
       }
       if (!hasColumn(table, "deletedAt")) {
@@ -233,7 +281,7 @@ export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfi
     }
 
     let audited = false;
-    return observeExecution(builder as object, () => {
+    const fireAudit = () => {
       if (audited) return;
       audited = true;
       const entry = createAuditEntry({
@@ -246,6 +294,10 @@ export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfi
       writeAuditEntry(entry).catch((err) => {
         console.error("[ledger] Failed to write soft-delete audit entry:", err);
       });
+    };
+
+    return observeExecution(builder as object, fireAudit, (proxy) => {
+      statementAudits.set(proxy, fireAudit);
     });
   };
 
@@ -253,6 +305,35 @@ export function createAuditedDb<T extends object>(db: T, config?: AuditedDbConfi
     get(target, prop, receiver) {
       if (prop === "delete") {
         return interceptDelete;
+      }
+
+      if (prop === "batch") {
+        const original = Reflect.get(target, prop, receiver);
+        if (typeof original !== "function") {
+          return original;
+        }
+        // Drizzle's batch reaches into each statement via _prepare()
+        // and never touches then()/execute(), so execution observation
+        // cannot fire there. Observe at the batch boundary instead:
+        // when the batch fulfills, fire the audit trigger of every
+        // member statement built through this wrapper.
+        return (statements: unknown[], ...args: unknown[]) => {
+          const result = (original as (...a: unknown[]) => unknown).call(
+            target,
+            statements,
+            ...args,
+          );
+          return Promise.resolve(result).then((batchResult) => {
+            if (Array.isArray(statements)) {
+              for (const statement of statements) {
+                if (statement !== null && typeof statement === "object") {
+                  statementAudits.get(statement)?.();
+                }
+              }
+            }
+            return batchResult;
+          });
+        };
       }
 
       if (prop === "transaction") {

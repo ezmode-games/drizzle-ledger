@@ -53,4 +53,5 @@ export {
   isSoftDeletePerformed,
   MissingSoftDeleteColumnError,
   SoftDeletePerformedError,
+  UnresolvedSoftDeleteTableError,
 } from "./errors.js";

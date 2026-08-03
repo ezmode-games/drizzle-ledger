@@ -69,3 +69,19 @@ export class MissingSoftDeleteColumnError extends Error {
     this.tableName = tableName;
   }
 }
+
+/**
+ * Error thrown by createAuditedDb in allowlist mode when the table
+ * object's name cannot be resolved: the allowlist cannot be consulted,
+ * and silently falling through to hard delete would defeat the mode.
+ */
+export class UnresolvedSoftDeleteTableError extends Error {
+  readonly code = "UNRESOLVED_SOFT_DELETE_TABLE" as const;
+
+  constructor() {
+    super(
+      "Cannot resolve the table name for a delete in softDeleteTables allowlist mode; refusing to guess between soft and hard delete",
+    );
+    this.name = "UnresolvedSoftDeleteTableError";
+  }
+}

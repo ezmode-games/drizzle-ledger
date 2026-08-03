@@ -2,7 +2,10 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { describe, expect, test, vi } from "vitest";
 import { createAuditedDb, getTableName, hasColumn } from "../../src/drizzle/db.js";
 import { createLedgerContext, runWithLedgerContext } from "../../src/core/context.js";
-import { MissingSoftDeleteColumnError } from "../../src/core/errors.js";
+import {
+  MissingSoftDeleteColumnError,
+  UnresolvedSoftDeleteTableError,
+} from "../../src/core/errors.js";
 import type { AuditLogEntry } from "../../src/core/types.js";
 
 // Test tables
@@ -220,7 +223,7 @@ describe("createAuditedDb", () => {
     const executions: string[] = [];
     const chain = {
       where: vi.fn(() => chain),
-      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      // oxlint-disable-next-line no-thenable -- intentionally thenable mock
       then: (onFulfilled?: (v: unknown) => unknown) =>
         Promise.resolve("executed").then((v) => {
           executions.push("run");
@@ -289,7 +292,7 @@ describe("createAuditedDb", () => {
     const chain = {
       where: vi.fn(() => chain),
       returning: vi.fn(() => chain),
-      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      // oxlint-disable-next-line no-thenable -- intentionally thenable mock
       then: (onFulfilled?: (v: unknown) => unknown) =>
         Promise.resolve([{ id: "u1" }]).then((v) => (onFulfilled ? onFulfilled(v) : v)),
     };
@@ -316,11 +319,95 @@ describe("createAuditedDb", () => {
     expect(entries[0].newData?.deletedAt).toBeInstanceOf(Date);
   });
 
+  test("catch-swallowed rejection never writes a false SOFT_DELETE entry", async () => {
+    const entries: unknown[] = [];
+    // Mirrors Drizzle's QueryPromise: catch delegates to this.then on
+    // the raw builder, and execute() rejects.
+    const chain: Record<string, unknown> = {};
+    chain.where = vi.fn(() => chain);
+    chain.then = function (
+      this: unknown,
+      onFulfilled?: (v: unknown) => unknown,
+      onRejected?: (e: unknown) => unknown,
+    ) {
+      return Promise.reject(new Error("D1 exploded")).then(onFulfilled, onRejected);
+    };
+    chain.catch = function (
+      this: { then: (f?: unknown, r?: unknown) => unknown },
+      onRejected?: (e: unknown) => unknown,
+    ) {
+      return this.then(undefined, onRejected);
+    };
+    const db = {
+      delete: vi.fn(),
+      update: vi.fn(() => ({ set: vi.fn(() => chain) })),
+    };
+
+    const auditedDb = createAuditedDb(db, {
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const swallowed = await auditedDb
+      .delete(usersWithSoftDelete)
+      .where({ id: "u1" })
+      .catch(() => "caught");
+
+    expect(swallowed).toBe("caught");
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The statement never executed successfully -- no entry
+    expect(entries).toHaveLength(0);
+  });
+
+  test("batch-executed soft-deletes fire their audit entries", async () => {
+    const entries: { action: string }[] = [];
+    const chain: Record<string, unknown> = { kind: "statement" };
+    chain.where = vi.fn(() => chain);
+    const batchSpy = vi.fn().mockResolvedValue(["ok"]);
+    const db = {
+      delete: vi.fn(),
+      update: vi.fn(() => ({ set: vi.fn(() => chain) })),
+      batch: batchSpy,
+    };
+
+    const auditedDb = createAuditedDb(db, {
+      writeAuditEntry: (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+    });
+
+    const stmt = auditedDb.delete(usersWithSoftDelete).where({ id: "u1" });
+    const result = await auditedDb.batch([stmt]);
+
+    expect(result).toEqual(["ok"]);
+    expect(batchSpy).toHaveBeenCalledTimes(1);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].action).toBe("SOFT_DELETE");
+  });
+
+  test("allowlist mode throws on an unresolvable table name instead of hard-deleting", () => {
+    const { db, deleteSpy } = createMockDb();
+
+    const auditedDb = createAuditedDb(db, { softDeleteTables: ["users"] });
+
+    // A table-like object with columns but no resolvable drizzle name
+    const anonymousTable = { id: { name: "id" }, deletedAt: { name: "deleted_at" } };
+
+    expect(() => auditedDb.delete(anonymousTable)).toThrow(UnresolvedSoftDeleteTableError);
+    expect(deleteSpy).not.toHaveBeenCalled();
+  });
+
   test("no audit entry for a statement that is never executed", async () => {
     const entries: AuditLogEntry[] = [];
     const chain = {
       where: vi.fn(() => chain),
-      // biome-ignore lint/suspicious/thenableReturn: intentionally thenable mock
+      // oxlint-disable-next-line no-thenable -- intentionally thenable mock
       then: (onFulfilled?: (v: unknown) => unknown) =>
         Promise.resolve(undefined).then((v) => (onFulfilled ? onFulfilled(v) : v)),
     };
