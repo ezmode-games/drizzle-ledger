@@ -524,6 +524,130 @@ describe("purgeUserData", () => {
     expect(statements).toHaveLength(3);
   });
 
+  test("admin-edited message reached via ownedRecords: content scrubbed, admin identity preserved", async () => {
+    // The AC1 scenario end-to-end: entry written by an admin about the
+    // user's message -- unreachable by userId/recordId matching, reached
+    // only via ownedRecords -- gets its JSON anonymized while the
+    // admin's identity fields survive.
+    const mockEntries = [
+      {
+        id: "entry-1",
+        tableName: "messages",
+        recordId: "msg-1",
+        action: "UPDATE",
+        oldData: JSON.stringify({ subject: "hi", body: "full email body", email: "u@test.com" }),
+        newData: JSON.stringify({ subject: "hi", body: "edited body", email: "u@test.com" }),
+        userId: "admin-456",
+        ip: "10.0.0.1",
+        userAgent: "AdminUA",
+        createdAt: new Date(),
+      },
+    ];
+
+    const updatedValues: Record<string, unknown>[] = [];
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(mockEntries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          updatedValues.push(values);
+          return {
+            where: vi.fn().mockResolvedValue(undefined),
+          };
+        }),
+      }),
+    };
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+      tableName: { name: "table_name" },
+    };
+
+    const result = await purgeUserData(
+      mockDb as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+      {
+        piiFields: ["email", "subject", "body"],
+        ownedRecords: [{ tableName: "messages", recordIds: ["msg-1"] }],
+      },
+    );
+
+    expect(result.entriesAnonymized).toBe(1);
+    // Message content scrubbed
+    const newData = JSON.parse(updatedValues[0].newData as string);
+    expect(newData.body).toBeUndefined();
+    expect(newData.subject).toBeUndefined();
+    expect(newData.email).toBeUndefined();
+    // Admin identity preserved -- they are not the purged user
+    expect(updatedValues[0].userId).toBe("admin-456");
+    expect(updatedValues[0].ip).toBe("10.0.0.1");
+    expect(updatedValues[0].userAgent).toBe("AdminUA");
+  });
+
+  test("each re-run appends its own PURGE entry -- gate on isUserDataPurged", async () => {
+    const insertedValues: Record<string, unknown>[] = [];
+    const makeDb = (entries: unknown[]) => ({
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(entries),
+        }),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockImplementation((values: Record<string, unknown>) => {
+          insertedValues.push(values);
+          return Promise.resolve();
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    });
+
+    const mockAuditTable = {
+      id: { name: "id" },
+      userId: { name: "user_id" },
+      recordId: { name: "record_id" },
+    };
+
+    // recordId-matched entries survive the first purge (recordId is
+    // never rewritten), so a second run finds and re-processes them
+    const persistentEntry = {
+      id: "entry-1",
+      tableName: "users",
+      recordId: "user-123",
+      action: "UPDATE",
+      oldData: null,
+      newData: null,
+      userId: "PURGED_USER",
+      ip: null,
+      userAgent: null,
+      createdAt: new Date(),
+    };
+
+    await purgeUserData(
+      makeDb([persistentEntry]) as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+    await purgeUserData(
+      makeDb([persistentEntry]) as unknown as Parameters<typeof purgeUserData>[0],
+      mockAuditTable as unknown as Parameters<typeof purgeUserData>[1],
+      "user-123",
+    );
+
+    // Documented behavior: one PURGE entry per run
+    expect(insertedValues.filter((v) => v.action === "PURGE")).toHaveLength(2);
+  });
+
   test("ownedRecords extends the match to records the user owns", async () => {
     const whereConditions: unknown[] = [];
     const mockDb = {

@@ -235,13 +235,16 @@ export async function purgeUserData(
  * Check whether audit entries still ATTRIBUTE actions to this user.
  * Useful for idempotency checks before/after purgeUserData.
  *
- * Limitation, by design: this checks the userId column only. Entries
- * matched by recordId or ownedRecords are intentionally PRESERVED by the
- * purge (their content is anonymized in place, their recordId is not
- * rewritten), so their continued existence cannot distinguish
- * purged-from-unpurged -- content-level verification post-hoc is not
+ * Limitation, by design: this checks the userId column only. The purge
+ * never rewrites recordId in ANY case -- not for ownedRecords matches,
+ * not even for the user's own row -- it anonymizes content in place.
+ * So any predicate containing recordId-based matching returns non-empty
+ * forever after a successful purge, and cannot distinguish
+ * purged-from-unpurged. Content-level verification post-hoc is not
  * possible from the rows alone. The PURGE audit entry is the record
- * that the erasure ran.
+ * that the erasure ran; note each re-run appends another PURGE entry
+ * (each run is its own recorded erasure event), so gate re-runs on this
+ * function.
  *
  * @param db - Drizzle database instance
  * @param auditTable - The audit log table
