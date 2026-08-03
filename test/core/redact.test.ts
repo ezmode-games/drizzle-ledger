@@ -68,6 +68,17 @@ describe("redactSensitiveFields", () => {
     expect(data.accessToken).toBe("gho_abc");
   });
 
+  test("Date instances round-trip intact, not flattened to {}", () => {
+    const createdAt = new Date("2026-08-02T12:00:00Z");
+    const data = { id: "u1", createdAt, accessToken: "gho_x" };
+    const result = redactSensitiveFields(data) as Record<string, unknown>;
+
+    expect(result.createdAt).toBe(createdAt);
+    expect(result.createdAt).toBeInstanceOf(Date);
+    // Serialization keeps the ISO string, not "{}"
+    expect(JSON.stringify(result)).toContain("2026-08-02T12:00:00.000Z");
+  });
+
   test("null and primitives pass through", () => {
     expect(redactSensitiveFields(null)).toBeNull();
     expect(redactSensitiveFields("plain")).toBe("plain");

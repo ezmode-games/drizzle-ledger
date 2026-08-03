@@ -340,22 +340,28 @@ export function createSoftDeleteCallback(
 
     // Log to audit (redacted, fail-closed on redaction failure)
     if (writeAuditEntry) {
+      let redacted: LedgerAuditEntry | null = null;
       try {
-        await writeAuditEntry(
-          redactAuditEntry(
-            {
-              tableName: "user",
-              recordId: user.id,
-              action: "SOFT_DELETE",
-              oldData: user as unknown as Record<string, unknown>,
-              newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
-              userId: user.id,
-            },
-            options.redactPatterns,
-          ),
+        redacted = redactAuditEntry(
+          {
+            tableName: "user",
+            recordId: user.id,
+            action: "SOFT_DELETE",
+            oldData: user as unknown as Record<string, unknown>,
+            newData: { ...user, ...deleteVals } as unknown as Record<string, unknown>,
+            userId: user.id,
+          },
+          options.redactPatterns,
         );
       } catch (error) {
-        safeLog("Failed to write audit entry for soft-delete", error);
+        safeLog("Redaction failed; soft-delete audit entry NOT written", error);
+      }
+      if (redacted) {
+        try {
+          await writeAuditEntry(redacted);
+        } catch (error) {
+          safeLog("Failed to write audit entry for soft-delete", error);
+        }
       }
     }
 
@@ -396,22 +402,28 @@ export function createDeleteAuditCallback(
   redactPatterns?: readonly string[],
 ): (user: User, request?: Request) => Promise<void> {
   return async (user: User, _request?: Request): Promise<void> => {
+    let redacted: LedgerAuditEntry | null = null;
     try {
-      await writeAuditEntry(
-        redactAuditEntry(
-          {
-            tableName: "user",
-            recordId: user.id,
-            action: "DELETE", // Hard delete action (user was permanently deleted)
-            oldData: user as unknown as Record<string, unknown>,
-            newData: null,
-            userId: user.id,
-          },
-          redactPatterns,
-        ),
+      redacted = redactAuditEntry(
+        {
+          tableName: "user",
+          recordId: user.id,
+          action: "DELETE", // Hard delete action (user was permanently deleted)
+          oldData: user as unknown as Record<string, unknown>,
+          newData: null,
+          userId: user.id,
+        },
+        redactPatterns,
       );
     } catch (error) {
-      safeLog("Failed to write audit entry for delete", error);
+      safeLog("Redaction failed; delete audit entry NOT written", error);
+    }
+    if (redacted) {
+      try {
+        await writeAuditEntry(redacted);
+      } catch (error) {
+        safeLog("Failed to write audit entry for delete", error);
+      }
     }
   };
 }
