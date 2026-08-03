@@ -8,7 +8,7 @@ pnpm add @rafters/ledger
 
 Peer dependency: `drizzle-orm >= 0.30.0`
 
-Two entry points: `@rafters/ledger` for the ORM-agnostic core (context, pure helpers, GDPR utilities), and `@rafters/ledger/drizzle` for the Drizzle adapter (schema, `createAuditedDb`, query filters, logging). Dialect-specific column definitions live at `@rafters/ledger/drizzle/soft-delete/sqlite`, `/pg`, and `/mysql`.
+Two entry points: `@rafters/ledger` for the ORM-agnostic core (context, pure helpers, always-on secret redaction, GDPR utilities), and `@rafters/ledger/drizzle` for the Drizzle adapter (schema, `createAuditedDb`, query filters, logging). Dialect-specific column definitions live at `@rafters/ledger/drizzle/soft-delete/sqlite`, `/pg`, and `/mysql`.
 
 ## Docs
 
@@ -23,6 +23,10 @@ Full documentation: [docs/](./docs/)
 | [GDPR](./docs/gdpr.mdx) | `purgeUserData`, PII anonymization, admin preservation |
 | [Better Auth](./docs/better-auth.mdx) | `ledgerPlugin`, `createSoftDeleteCallback`, flow control |
 | [API Reference](./docs/api-reference.mdx) | Every export, every type, organized by subpath |
+
+## Soft-delete is not deletion until sessions die
+
+`createSoftDeleteCallback` intercepts better-auth's `deleteUser` by throwing, which also aborts better-auth's own cleanup: nothing else revokes sessions, account/OAuth rows survive, and better-auth session resolution knows nothing about `deletedAt`. The callback therefore REQUIRES a `revokeSessions` implementation and runs it before anything else -- and you must additionally gate authentication on `deletedAt`, or an OAuth sign-in on the soft-deleted row silently resurrects the account. The full contract and a sign-in gate recipe live in the [Better Auth guide](./docs/better-auth.mdx) and on the `createSoftDeleteCallback` docblock.
 
 ## License
 

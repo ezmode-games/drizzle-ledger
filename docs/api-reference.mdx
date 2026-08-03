@@ -644,7 +644,7 @@ Thrown by `createSoftDeleteCallback` to interrupt the hard delete after a succes
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auditTables` | `("user" \| "account" \| "session" \| "verification")[] \| undefined` | `["user", "account"]` | Tables to register create/update hooks on |
+| `auditTables` | `("user" \| "account" \| "session" \| "verification")[] \| undefined` | `["user"]` | Tables to register create/update hooks on |
 | `softDeleteTables` | `"user"[] \| undefined` | `[]` | Tables for which to log a SOFT_DELETE entry before deletion; currently only `"user"` is supported |
 | `writeAuditEntry` | `(entry: LedgerAuditEntry) => Promise<void> \| undefined` | — | Callback invoked for each audit entry; audit logging disabled if omitted |
 
@@ -671,6 +671,14 @@ Thrown by `createSoftDeleteCallback` to interrupt the hard delete after a succes
 | `userTable` | `{ id: Column; deletedAt: Column; deletedBy?: Column }` | User table with soft-delete columns |
 | `whereUserId` | `(userId: string) => SQL` | WHERE clause builder |
 | `writeAuditEntry` | `(entry: LedgerAuditEntry) => Promise<void> \| undefined` | Optional audit callback |
+
+### `redactSensitiveFields(data, extraPatterns?)`
+
+Replaces values under secret-bearing keys with `"[REDACTED]"`, recursing objects and arrays (`Date` passes through). Keys match `DEFAULT_SECRET_PATTERNS` (`token`, `secret`, `password`, `apikey`, `api_key`) plus `extraPatterns`, case-insensitively as substrings. Applied automatically -- and non-optionally, fail-closed -- to every better-auth plugin audit path. Exported for standalone use.
+
+### `DEFAULT_SECRET_PATTERNS` / `REDACTED_VALUE`
+
+The default pattern list and the replacement sentinel used by `redactSensitiveFields`.
 
 ### `assertLedgerContextAvailable()`
 

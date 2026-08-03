@@ -41,6 +41,9 @@ export {
 // Audit (pure helpers)
 export { type AuditAction, type AuditEntryOptions, createAuditEntry } from "./audit.js";
 
+// Redaction (pure helpers)
+export { DEFAULT_SECRET_PATTERNS, REDACTED_VALUE, redactSensitiveFields } from "./redact.js";
+
 // GDPR (pure helpers)
 export {
   anonymizeJsonData,
