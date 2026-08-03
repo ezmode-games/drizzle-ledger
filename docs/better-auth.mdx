@@ -136,8 +136,19 @@ const softDelete = createSoftDeleteCallback({
     // and clears secondaryStorage itself. auth.api.revokeUserSessions
     // would NOT work here: it exists only with the admin() plugin and
     // requires an authenticated admin session.
+    //
+    // VERSION NOTE: better-auth split this API mid-1.6. Late 1.6.x has
+    // deleteUserSessions(userId); before the split, deleteSessions
+    // accepted a userId directly -- and on post-split versions
+    // deleteSessions(userId) SILENTLY DELETES NOTHING (it now takes
+    // arrays of session tokens). Feature-detect:
     const ctx = await auth.$context;
-    await ctx.internalAdapter.deleteSessions(userId);
+    const ia = ctx.internalAdapter;
+    if ("deleteUserSessions" in ia) {
+      await ia.deleteUserSessions(userId);
+    } else {
+      await ia.deleteSessions(userId);
+    }
   },
   writeAuditEntry: async (entry) => {
     await db.insert(auditLog).values({
