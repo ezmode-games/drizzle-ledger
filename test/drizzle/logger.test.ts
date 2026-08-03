@@ -56,6 +56,21 @@ describe("parseQuery", () => {
   test("returns null for empty query", () => {
     expect(parseQuery("")).toBeNull();
   });
+
+  test("schema-qualified names attribute to the table, not the schema", () => {
+    expect(parseQuery("INSERT INTO main.users (id) VALUES (?)")).toEqual({
+      action: "INSERT",
+      table: "users",
+    });
+    expect(parseQuery('UPDATE "main"."users" SET name = ?')).toEqual({
+      action: "UPDATE",
+      table: "users",
+    });
+    expect(parseQuery("DELETE FROM main.users WHERE id = ?")).toEqual({
+      action: "DELETE",
+      table: "users",
+    });
+  });
 });
 
 describe("extractRecordId", () => {
@@ -107,6 +122,10 @@ describe("classifyUnparsedMutation", () => {
     expect(classifyUnparsedMutation("PRAGMA table_info(users)")).toBeNull();
     expect(classifyUnparsedMutation("BEGIN")).toBeNull();
     expect(classifyUnparsedMutation("SELECT * FROM users")).toBeNull();
+  });
+
+  test("returns null for read-only CTEs -- no phantom mutations", () => {
+    expect(classifyUnparsedMutation("WITH t AS (SELECT id FROM users) SELECT * FROM t")).toBeNull();
   });
 });
 
@@ -410,6 +429,62 @@ describe("AuditLogger", () => {
     expect(entries).toHaveLength(0);
     await logger.flush();
     expect(entries).toHaveLength(2);
+  });
+
+  test("a read-only CTE produces no entry even without logSelects", async () => {
+    const entries: AuditEntryInput[] = [];
+    const logger = new AuditLogger((entry) => {
+      entries.push(entry);
+      return Promise.resolve();
+    });
+
+    logger.logQuery("WITH t AS (SELECT id FROM users) SELECT * FROM t", []);
+
+    await logger.flush();
+
+    expect(entries).toHaveLength(0);
+  });
+
+  test("a synchronously-throwing sink never breaks the query path", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logger = new AuditLogger((() => {
+      throw new Error("sync sink explosion");
+    }) as unknown as (entry: AuditEntryInput) => Promise<void>);
+
+    expect(() => logger.logQuery("INSERT INTO users (id) VALUES (?)", ["u1"])).not.toThrow();
+    await logger.flush();
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      "[ledger] Failed to write audit entry:",
+      expect.any(Error),
+    );
+    consoleSpy.mockRestore();
+  });
+
+  test("a throwing onUnparsedMutation hook never breaks the query path", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const entries: AuditEntryInput[] = [];
+    const logger = new AuditLogger(
+      (entry) => {
+        entries.push(entry);
+        return Promise.resolve();
+      },
+      {
+        onUnparsedMutation: () => {
+          throw new Error("hook explosion");
+        },
+      },
+    );
+
+    expect(() =>
+      logger.logQuery("WITH doomed AS (SELECT 1) DELETE FROM users WHERE id IN (SELECT 1)", []),
+    ).not.toThrow();
+    await logger.flush();
+
+    // The unknown entry is still written despite the throwing hook
+    expect(entries).toHaveLength(1);
+    expect(entries[0].tableName).toBe("unknown");
+    consoleSpy.mockRestore();
   });
 
   test("onWriteError receives failures instead of console when configured", async () => {

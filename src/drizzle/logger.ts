@@ -91,28 +91,35 @@ export interface AuditLoggerConfig {
 export function parseQuery(query: string): ParsedQuery | null {
   const normalized = query.trim();
 
-  // INSERT INTO table_name
-  const insertMatch = normalized.match(/^INSERT\s+INTO\s+[`"']?(\w+)[`"']?/i);
+  // Table reference: optionally schema-qualified (main.users, "s"."t").
+  // The LAST identifier is the table; attributing to the schema segment
+  // would be a confidently wrong table name.
+  const insertMatch = normalized.match(
+    /^INSERT\s+INTO\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (insertMatch?.[1]) {
-    return { action: "INSERT", table: insertMatch[1].toLowerCase() };
+    return { action: "INSERT", table: (insertMatch[2] ?? insertMatch[1]).toLowerCase() };
   }
 
-  // UPDATE table_name
-  const updateMatch = normalized.match(/^UPDATE\s+[`"']?(\w+)[`"']?/i);
+  const updateMatch = normalized.match(
+    /^UPDATE\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (updateMatch?.[1]) {
-    return { action: "UPDATE", table: updateMatch[1].toLowerCase() };
+    return { action: "UPDATE", table: (updateMatch[2] ?? updateMatch[1]).toLowerCase() };
   }
 
-  // DELETE FROM table_name
-  const deleteMatch = normalized.match(/^DELETE\s+FROM\s+[`"']?(\w+)[`"']?/i);
+  const deleteMatch = normalized.match(
+    /^DELETE\s+FROM\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/i,
+  );
   if (deleteMatch?.[1]) {
-    return { action: "DELETE", table: deleteMatch[1].toLowerCase() };
+    return { action: "DELETE", table: (deleteMatch[2] ?? deleteMatch[1]).toLowerCase() };
   }
 
-  // SELECT ... FROM table_name
-  const selectMatch = normalized.match(/^SELECT\s+.+?\s+FROM\s+[`"']?(\w+)[`"']?/is);
+  const selectMatch = normalized.match(
+    /^SELECT\s+.+?\s+FROM\s+[`"']?(\w+)[`"']?(?:\s*\.\s*[`"']?(\w+)[`"']?)?/is,
+  );
   if (selectMatch?.[1]) {
-    return { action: "SELECT", table: selectMatch[1].toLowerCase() };
+    return { action: "SELECT", table: (selectMatch[2] ?? selectMatch[1]).toLowerCase() };
   }
 
   return null;
@@ -121,9 +128,11 @@ export function parseQuery(query: string): ParsedQuery | null {
 /**
  * Detect a query that mutates data even though parseQuery could not
  * resolve its target table: CTE-led statements (WITH ... DELETE),
- * INSERT OR REPLACE / REPLACE INTO, schema-qualified names, and other
- * shapes outside the simple parser. Best-effort classification of the
- * action for the "unknown" entry.
+ * INSERT OR REPLACE / REPLACE INTO, and other shapes outside the simple
+ * parser. Best-effort classification of the action for the "unknown"
+ * entry. Returns null for mutation-shaped leads with no mutation verb
+ * (a read-only CTE) -- fabricating a phantom mutation would be worse
+ * than the silent skip this function exists to prevent.
  */
 export function classifyUnparsedMutation(query: string): "INSERT" | "UPDATE" | "DELETE" | null {
   const normalized = query.trim().toUpperCase();
@@ -146,7 +155,13 @@ export function classifyUnparsedMutation(query: string): "INSERT" | "UPDATE" | "
   if (/\bINSERT\b|\bREPLACE\b|\bMERGE\b/.test(normalized)) {
     return "INSERT";
   }
-  return "UPDATE";
+  if (/\bUPDATE\b/.test(normalized)) {
+    return "UPDATE";
+  }
+  // Mutation-shaped lead but no mutation verb anywhere: a read-only CTE
+  // (WITH t AS (SELECT ...) SELECT ...). Writing an "unknown" mutation
+  // entry here would fabricate a phantom mutation -- return null.
+  return null;
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -212,7 +227,12 @@ export class AuditLogger implements Logger {
       // A mutation we could not parse must not vanish from the trail.
       const action = classifyUnparsedMutation(query);
       if (action) {
-        this.config?.onUnparsedMutation?.(query);
+        try {
+          this.config?.onUnparsedMutation?.(query);
+        } catch (err) {
+          // A throwing hook must never break the query path.
+          console.error("[ledger] onUnparsedMutation hook threw:", err);
+        }
         this.write({
           tableName: "unknown",
           recordId: null,
@@ -274,14 +294,23 @@ export class AuditLogger implements Logger {
   }
 
   private write(entry: AuditEntryInput): void {
-    const promise = this.writeAuditEntry(entry).catch((err) => {
-      const onWriteError = this.config?.onWriteError;
-      if (onWriteError) {
-        onWriteError(err, entry);
-      } else {
-        console.error("[ledger] Failed to write audit entry:", err);
-      }
-    });
+    // Promise.resolve().then(...) normalizes a synchronously-throwing
+    // sink into a rejection the .catch below handles -- a sync throw
+    // must never propagate into Drizzle's query path.
+    const promise = Promise.resolve()
+      .then(() => this.writeAuditEntry(entry))
+      .catch((err) => {
+        const onWriteError = this.config?.onWriteError;
+        if (onWriteError) {
+          try {
+            onWriteError(err, entry);
+          } catch (hookErr) {
+            console.error("[ledger] onWriteError hook threw:", hookErr);
+          }
+        } else {
+          console.error("[ledger] Failed to write audit entry:", err);
+        }
+      });
 
     if (this.config?.waitUntil) {
       this.config.waitUntil(promise);
