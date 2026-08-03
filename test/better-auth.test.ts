@@ -316,6 +316,7 @@ describe("createSoftDeleteCallback", () => {
       db: mockDb,
       userTable: mockTable,
       whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockResolvedValue(undefined),
     });
 
     const user = {
@@ -353,6 +354,7 @@ describe("createSoftDeleteCallback", () => {
       db: mockDb,
       userTable: { id: {}, deletedAt: {}, deletedBy: {} },
       whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockResolvedValue(undefined),
       writeAuditEntry: (entry) => {
         entries.push(entry);
         return Promise.resolve();
@@ -397,6 +399,7 @@ describe("createSoftDeleteCallback", () => {
       db: mockDb,
       userTable: { id: {}, deletedAt: {}, deletedBy: {} },
       whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockResolvedValue(undefined),
       writeAuditEntry: (entry) => {
         entries.push(entry);
         return Promise.resolve();
@@ -436,6 +439,7 @@ describe("createSoftDeleteCallback", () => {
       db: mockDb,
       userTable: { id: {}, deletedAt: {} },
       whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockResolvedValue(undefined),
     });
 
     const user = {
@@ -457,6 +461,102 @@ describe("createSoftDeleteCallback", () => {
       expect((error as SoftDeletePerformedError).softDeleted).toBe(true);
       expect((error as SoftDeletePerformedError).userId).toBe("user-789");
     }
+  });
+});
+
+describe("createSoftDeleteCallback session revocation", () => {
+  const user = {
+    id: "user-1",
+    email: "x@test.com",
+    name: "X",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    emailVerified: false,
+    image: null,
+  };
+
+  function mockDbWithSpies() {
+    const where = vi.fn().mockResolvedValue(undefined);
+    const set = vi.fn().mockReturnValue({ where });
+    const update = vi.fn().mockReturnValue({ set });
+    return { db: { update }, update, set, where };
+  }
+
+  test("revokes sessions BEFORE the soft-delete update", async () => {
+    const order: string[] = [];
+    const { db, update } = mockDbWithSpies();
+    update.mockImplementation(() => {
+      order.push("update");
+      return { set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }) };
+    });
+
+    const callback = createSoftDeleteCallback({
+      db,
+      userTable: { id: {}, deletedAt: {} },
+      whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockImplementation(async () => {
+        order.push("revoke");
+      }),
+    });
+
+    await expect(callback(user)).rejects.toThrow(SoftDeletePerformedError);
+    expect(order).toEqual(["revoke", "update"]);
+  });
+
+  test("revocation failure aborts: no update, no success signal", async () => {
+    const { db, update } = mockDbWithSpies();
+
+    const callback = createSoftDeleteCallback({
+      db,
+      userTable: { id: {}, deletedAt: {} },
+      whereUserId: (userId) => ({ id: userId }),
+      revokeSessions: vi.fn().mockRejectedValue(new Error("KV unavailable")),
+    });
+
+    await expect(callback(user)).rejects.toThrow("KV unavailable");
+    // NOT the success error
+    try {
+      await callback(user);
+    } catch (error) {
+      expect(isSoftDeletePerformed(error)).toBe(false);
+    }
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  test("update failure after successful revocation rethrows the real error", async () => {
+    const { db, update } = mockDbWithSpies();
+    update.mockImplementation(() => ({
+      set: vi.fn().mockReturnValue({
+        where: vi.fn().mockRejectedValue(new Error("D1 write failed")),
+      }),
+    }));
+
+    const revokeSessions = vi.fn().mockResolvedValue(undefined);
+    const callback = createSoftDeleteCallback({
+      db,
+      userTable: { id: {}, deletedAt: {} },
+      whereUserId: (userId) => ({ id: userId }),
+      revokeSessions,
+    });
+
+    await expect(callback(user)).rejects.toThrow("D1 write failed");
+    expect(revokeSessions).toHaveBeenCalledWith("user-1");
+  });
+
+  test("passes the user id to revokeSessions", async () => {
+    const { db } = mockDbWithSpies();
+    const revokeSessions = vi.fn().mockResolvedValue(undefined);
+
+    const callback = createSoftDeleteCallback({
+      db,
+      userTable: { id: {}, deletedAt: {} },
+      whereUserId: (userId) => ({ id: userId }),
+      revokeSessions,
+    });
+
+    await expect(callback(user)).rejects.toThrow(SoftDeletePerformedError);
+    expect(revokeSessions).toHaveBeenCalledTimes(1);
+    expect(revokeSessions).toHaveBeenCalledWith("user-1");
   });
 });
 
