@@ -26,7 +26,8 @@ import { createLedgerContext } from "@rafters/ledger";
 
 const context = createLedgerContext({
   userId: session?.user?.id ?? null,
-  ip: req.headers["x-forwarded-for"] ?? null,
+  // Trusted source only -- x-forwarded-for is client-controlled
+  ip: req.headers["cf-connecting-ip"] ?? null,
   userAgent: req.headers["user-agent"] ?? null,
   endpoint: `${req.method} ${req.url}`,
   requestId: crypto.randomUUID(),
@@ -75,7 +76,11 @@ export const ledgerMiddleware = createMiddleware(async (c, next) => {
   return runWithLedgerContext(
     createLedgerContext({
       userId: user?.id ?? null,
-      ip: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+      // IP NOTE: x-forwarded-for / x-real-ip are client-controlled and
+      // spoof the audit ip. Use your platform's trusted client-ip source
+      // (CF-Connecting-IP on Cloudflare, the leftmost VERIFIED hop
+      // behind your own proxy) -- never the raw header chain.
+      ip: c.req.header("cf-connecting-ip") ?? null,
       userAgent: c.req.header("user-agent") ?? null,
       endpoint: `${c.req.method} ${c.req.path}`,
       requestId: c.req.header("x-request-id") ?? crypto.randomUUID(),

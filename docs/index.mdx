@@ -56,7 +56,7 @@ import { createLedgerContext, runWithLedgerContext } from '@rafters/ledger';
 app.use(async (c, next) => {
   const context = createLedgerContext({
     userId: c.get('user')?.id,
-    ip: c.req.header('x-forwarded-for'),
+    ip: c.req.header('cf-connecting-ip'), // trusted source, not x-forwarded-for
     userAgent: c.req.header('user-agent'),
     endpoint: `${c.req.method} ${c.req.path}`,
   });

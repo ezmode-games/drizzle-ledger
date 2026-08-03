@@ -59,13 +59,32 @@ export const AUDIT_LOG_INDEXES = [
 ] as const;
 
 /**
- * Optional append-only protection: rules that reject UPDATE and DELETE
- * on the audit table at the engine. Apply in a migration.
- * NOTE: purgeUserData legitimately UPDATEs audit rows -- if you use the
- * GDPR purge, apply only the delete-blocking rule, or drop and
- * re-create the update rule around purge runs.
+ * Build append-only protection SQL for a given audit table name:
+ * a plpgsql trigger function that RAISEs on UPDATE/DELETE, so tampering
+ * FAILS LOUDLY (an exception the caller must handle and can alert on)
+ * rather than being silently swallowed -- pg RULEs with DO INSTEAD
+ * NOTHING would return success on a blocked write, giving a tamperer no
+ * signal. Apply in a migration. Requires PostgreSQL 14+ (CREATE OR
+ * REPLACE TRIGGER).
+ *
+ * NOTES:
+ * - purgeUserData legitimately UPDATEs audit rows -- if you use the
+ *   GDPR purge, apply only the delete-blocking trigger, or drop and
+ *   re-create the update trigger around purge runs.
+ * - Pass the SAME table name you gave createAuditLogTable /
+ *   createAuditedDb's auditTableName; protecting the default name while
+ *   writing to a custom table protects nothing.
+ * - Function/trigger names derive from the table name. CREATE OR
+ *   REPLACE clobbers a pre-existing same-named function -- if you
+ *   already have one, rename yours or verify the replacement is wanted.
  */
-export const AUDIT_LOG_PROTECT_SQL = [
-  "CREATE OR REPLACE RULE audit_log_no_update AS ON UPDATE TO audit_log DO INSTEAD NOTHING",
-  "CREATE OR REPLACE RULE audit_log_no_delete AS ON DELETE TO audit_log DO INSTEAD NOTHING",
-] as const;
+export function auditLogProtectSql(tableName = "audit_log"): readonly [string, string, string] {
+  return [
+    `CREATE OR REPLACE FUNCTION ${tableName}_block_write() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION '${tableName} is append-only'; END; $$ LANGUAGE plpgsql`,
+    `CREATE OR REPLACE TRIGGER trg_${tableName}_no_update BEFORE UPDATE ON ${tableName} FOR EACH ROW EXECUTE FUNCTION ${tableName}_block_write()`,
+    `CREATE OR REPLACE TRIGGER trg_${tableName}_no_delete BEFORE DELETE ON ${tableName} FOR EACH ROW EXECUTE FUNCTION ${tableName}_block_write()`,
+  ] as const;
+}
+
+/** Append-only protection for the default audit_log table. */
+export const AUDIT_LOG_PROTECT_SQL = auditLogProtectSql();

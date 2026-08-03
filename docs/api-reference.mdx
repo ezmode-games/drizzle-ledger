@@ -671,3 +671,19 @@ Thrown by `createSoftDeleteCallback` to interrupt the hard delete after a succes
 | `userTable` | `{ id: Column; deletedAt: Column; deletedBy?: Column }` | User table with soft-delete columns |
 | `whereUserId` | `(userId: string) => SQL` | WHERE clause builder |
 | `writeAuditEntry` | `(entry: LedgerAuditEntry) => Promise<void> \| undefined` | Optional audit callback |
+
+### `assertLedgerContextAvailable()`
+
+Throws `LedgerContextUnavailableError` when `AsyncLocalStorage` is missing from the runtime. Call at boot to fail fast instead of shipping an unattributed audit trail -- without it, the first degraded access logs a single warning and every entry's `userId` (and soft-delete `deletedBy`) is silently `null`.
+
+### `LedgerContextUnavailableError` / `AuditTableDeleteError`
+
+Typed errors (codes `LEDGER_CONTEXT_UNAVAILABLE`, `AUDIT_TABLE_DELETE`) thrown by the boot assertion and by `createAuditedDb` when a delete targets the audit table. `AuditTableDeleteError` carries the refused `tableName`.
+
+### `auditLogProtectSql(tableName?)` / `AUDIT_LOG_PROTECT_SQL`
+
+Per-dialect (`@rafters/ledger/drizzle/schema/{sqlite,pg,mysql}`) builders for engine-level append-only protection on the audit table: UPDATE and DELETE fail loudly (SQLite `RAISE(ABORT)`, PostgreSQL plpgsql `RAISE EXCEPTION` -- requires PostgreSQL 14+, MySQL `SIGNAL`). `AUDIT_LOG_PROTECT_SQL` is the default-name invocation. Pass the same table name you gave `createAuditLogTable` and `createAuditedDb`'s `auditTableName`. See the Audit Trail guide for the purge-interaction and trigger-name-collision caveats.
+
+### `AuditedDbConfig.auditTableName`
+
+Name of the audit log table (default `"audit_log"`). `createAuditedDb` throws `AuditTableDeleteError` on any delete targeting it -- the trail is not wipeable through ledger's own wrapper.

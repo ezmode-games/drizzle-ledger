@@ -55,13 +55,27 @@ export const AUDIT_LOG_INDEXES = [
 ] as const;
 
 /**
- * Optional append-only protection: triggers that reject UPDATE and
- * DELETE on the audit table at the engine. Apply in a migration.
- * NOTE: purgeUserData legitimately UPDATEs audit rows -- if you use the
- * GDPR purge, apply only the delete-blocking trigger, or drop and
- * re-create the update trigger around purge runs.
+ * Build append-only protection SQL for a given audit table name:
+ * triggers that SIGNAL on UPDATE/DELETE, so tampering fails loudly at
+ * the engine. Apply in a migration.
+ *
+ * NOTES:
+ * - purgeUserData legitimately UPDATEs audit rows -- if you use the
+ *   GDPR purge, apply only the delete-blocking trigger, or drop and
+ *   re-create the update trigger around purge runs.
+ * - Pass the SAME table name you gave createAuditLogTable /
+ *   createAuditedDb's auditTableName; protecting the default name while
+ *   writing to a custom table protects nothing.
+ * - Trigger names derive from the table name; mysql CREATE TRIGGER has
+ *   no IF NOT EXISTS (repo convention, see api-reference), so a
+ *   pre-existing same-named trigger errors -- resolve deliberately.
  */
-export const AUDIT_LOG_PROTECT_SQL = [
-  "CREATE TRIGGER trg_audit_log_no_update BEFORE UPDATE ON audit_log FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_log is append-only'",
-  "CREATE TRIGGER trg_audit_log_no_delete BEFORE DELETE ON audit_log FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_log is append-only'",
-] as const;
+export function auditLogProtectSql(tableName = "audit_log"): readonly [string, string] {
+  return [
+    `CREATE TRIGGER trg_${tableName}_no_update BEFORE UPDATE ON ${tableName} FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${tableName} is append-only'`,
+    `CREATE TRIGGER trg_${tableName}_no_delete BEFORE DELETE ON ${tableName} FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${tableName} is append-only'`,
+  ] as const;
+}
+
+/** Append-only protection for the default audit_log table. */
+export const AUDIT_LOG_PROTECT_SQL = auditLogProtectSql();

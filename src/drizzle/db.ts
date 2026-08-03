@@ -58,8 +58,10 @@ export interface AuditedDbConfig {
   /**
    * Name of the audit log table (default: "audit_log"). Deletes on it
    * through this wrapper THROW -- the trail must not be wipeable via
-   * ledger's own APIs. Pair with AUDIT_LOG_PROTECT_SQL for
-   * engine-level append-only enforcement.
+   * ledger's own APIs. Pair with auditLogProtectSql(auditTableName)
+   * from the dialect schema module for engine-level append-only
+   * enforcement -- pass the SAME name to both, or the SQL protects a
+   * table you never write to.
    */
   auditTableName?: string;
 }

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   assertLedgerContextAvailable,
   createLedgerContext,
@@ -113,11 +113,55 @@ describe("hasLedgerContext", () => {
 
 describe("assertLedgerContextAvailable", () => {
   test("does not throw where AsyncLocalStorage exists", () => {
-    // The test runtime (Node) has AsyncLocalStorage, so the boot
-    // assertion passes; the throwing path is exercised by construction
-    // of LedgerContextUnavailableError below, since simulating a
-    // missing global after module init would require module-state
-    // manipulation the lazy singleton intentionally prevents.
     expect(() => assertLedgerContextAvailable()).not.toThrow();
+  });
+});
+
+describe("AsyncLocalStorage degradation", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+  });
+
+  async function freshContextModuleWithoutALS() {
+    vi.stubGlobal("AsyncLocalStorage", undefined);
+    vi.resetModules();
+    return await import("../../src/core/context.js");
+  }
+
+  test("boot assertion throws when AsyncLocalStorage is missing", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const mod = await freshContextModuleWithoutALS();
+
+    expect(() => mod.assertLedgerContextAvailable()).toThrow("AsyncLocalStorage is not available");
+    consoleSpy.mockRestore();
+  });
+
+  test("warns exactly once on degraded access, then stays quiet", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const mod = await freshContextModuleWithoutALS();
+
+    expect(mod.getLedgerContext()).toBeNull();
+    expect(mod.getLedgerContext()).toBeNull();
+    expect(mod.hasLedgerContext()).toBe(false);
+
+    const warnings = consoleSpy.mock.calls.filter((call) =>
+      String(call[0]).includes("AsyncLocalStorage is not available"),
+    );
+    expect(warnings).toHaveLength(1);
+    consoleSpy.mockRestore();
+  });
+
+  test("runWithLedgerContext still executes the callback when degraded", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const mod = await freshContextModuleWithoutALS();
+
+    const result = await mod.runWithLedgerContext(
+      mod.createLedgerContext({ userId: "u1" }),
+      async () => "ran",
+    );
+
+    expect(result).toBe("ran");
+    consoleSpy.mockRestore();
   });
 });
